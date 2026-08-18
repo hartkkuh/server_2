@@ -1,11 +1,9 @@
-FROM alpine:3.22
+FROM python:3.12-alpine
 
-RUN apk add --no-cache \
-    3proxy \
-    ca-certificates
+WORKDIR /app
 
-COPY 3proxy.cfg /etc/3proxy/3proxy.cfg
+COPY proxy.py .
 
-EXPOSE 3128
+EXPOSE 8080
 
-CMD ["3proxy", "/etc/3proxy/3proxy.cfg"]
+CMD ["python", "proxy.py"]
