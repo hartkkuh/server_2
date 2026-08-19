@@ -177,7 +177,7 @@ jobs:
       - name: Start runner
         env:
           RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
-          RELAY_URL: wss://github-proxy-relay.onrender.com/ws
+          RELAY_URL: wss://server-2-vddr.onrender.com/ws
         run: |
           nohup python3 runner.py > runner.log 2>&1 &
 
