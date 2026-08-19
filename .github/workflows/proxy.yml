@@ -1,0 +1,207 @@
+name: Internet Proxy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  proxy:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 350
+
+    steps:
+
+      - name: Install Squid
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y squid curl python3 python3-pip
+
+      - name: Configure Squid
+        run: |
+          sudo tee /etc/squid/squid.conf > /dev/null <<'EOF'
+
+          http_port 127.0.0.1:3128
+
+          acl all src all
+          http_access allow all
+
+          cache deny all
+
+          forwarded_for delete
+          via off
+
+          access_log none
+
+          EOF
+
+          sudo squid -k parse
+
+          sudo systemctl restart squid
+
+      - name: Test Squid
+        run: |
+          echo "Runner IP:"
+          curl -4 https://ifconfig.me
+
+          echo
+
+          echo "Testing Squid:"
+          curl \
+            --proxy http://127.0.0.1:3128 \
+            https://ifconfig.me
+
+      - name: Install WebSocket client
+        run: |
+          python3 -m pip install websockets
+
+      - name: Create runner bridge
+        env:
+          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+        run: |
+
+          cat > runner.py <<'PYTHON'
+          import asyncio
+          import json
+          import os
+
+          import websockets
+
+
+          RELAY = os.environ["RELAY_URL"]
+          TOKEN = os.environ["RELAY_TOKEN"]
+
+          SQUID_HOST = "127.0.0.1"
+          SQUID_PORT = 3128
+
+
+          async def bridge(ws):
+
+              reader, writer = await asyncio.open_connection(
+                  SQUID_HOST,
+                  SQUID_PORT,
+              )
+
+              async def websocket_to_squid():
+
+                  try:
+
+                      async for message in ws:
+
+                          if isinstance(message, bytes):
+
+                              writer.write(message)
+
+                              await writer.drain()
+
+                  except Exception:
+                      pass
+
+
+              async def squid_to_websocket():
+
+                  try:
+
+                      while True:
+
+                          data = await reader.read(65536)
+
+                          if not data:
+                              break
+
+                          await ws.send(data)
+
+                  except Exception:
+                      pass
+
+
+              await asyncio.gather(
+                  websocket_to_squid(),
+                  squid_to_websocket(),
+              )
+
+              writer.close()
+
+              try:
+                  await writer.wait_closed()
+              except Exception:
+                  pass
+
+
+          async def main():
+
+              while True:
+
+                  try:
+
+                      async with websockets.connect(
+                          RELAY,
+                          ping_interval=20,
+                          ping_timeout=20,
+                          max_size=None,
+                      ) as ws:
+
+                          await ws.send(
+                              json.dumps({
+                                  "type": "auth",
+                                  "role": "runner",
+                                  "token": TOKEN,
+                              })
+                          )
+
+                          while True:
+
+                              message = await ws.recv()
+
+                              if isinstance(message, str):
+
+                                  data = json.loads(message)
+
+                                  if data.get("type") == "connect":
+
+                                      await bridge(ws)
+
+                                      break
+
+                  except Exception as e:
+
+                      print("Runner connection error:", e)
+
+                  await asyncio.sleep(5)
+
+
+          asyncio.run(main())
+          PYTHON
+
+          chmod +x runner.py
+
+      - name: Start runner
+        env:
+          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+          RELAY_URL: wss://github-proxy-relay.onrender.com/ws
+        run: |
+          nohup python3 runner.py > runner.log 2>&1 &
+
+      - name: Keep runner alive
+        run: |
+          while true; do
+
+            echo "=============================="
+            echo "$(date)"
+            echo "Proxy is running"
+            echo "=============================="
+
+            echo
+            echo "Runner IP:"
+            curl -4 https://ifconfig.me || true
+
+            echo
+            echo "Squid:"
+            sudo ss -lntp | grep 3128 || true
+
+            echo
+            echo "Relay:"
+            tail -n 10 runner.log || true
+
+            sleep 60
+
+          done
