@@ -181,6 +181,18 @@ jobs:
         run: |
           nohup python3 runner.py > runner.log 2>&1 &
 
+
+      - name: Check runner connection
+        run: |
+          sleep 5
+
+          echo "===== runner.log ====="
+          cat runner.log || true
+
+          echo
+          echo "===== processes ====="
+          ps aux | grep runner.py || true
+
       - name: Keep runner alive
         run: |
           while true; do
