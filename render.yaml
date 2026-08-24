@@ -2,12 +2,11 @@ services:
   - type: web
     name: github-proxy-relay
     runtime: python
+    plan: free
 
     buildCommand: pip install -r requirements.txt
 
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
-
-    plan: free
 
     envVars:
       - key: RELAY_TOKEN
