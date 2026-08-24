@@ -228,11 +228,6 @@ async def client(ws: WebSocket):
                 None,
             )
 
-        await relay(
-            ws,
-            bridge,
-        )
-
     except Exception as e:
 
         print(
