@@ -33,7 +33,7 @@ jobs:
 
 
       # =====================================
-      # Install dependencies
+      # Install
       # =====================================
 
       - name: Install dependencies
@@ -45,7 +45,7 @@ jobs:
 
 
       # =====================================
-      # Start Runner
+      # Run
       # =====================================
 
       - name: Start tunnel

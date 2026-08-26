@@ -28,6 +28,8 @@ TOKEN = os.environ.get(
     "CHANGE_ME"
 )
 
+RECV_TIMEOUT = 10
+
 
 # =========================================
 # Connection object
@@ -38,7 +40,6 @@ class Connection:
     def __init__(self):
 
         self.to_runner = asyncio.Queue()
-
         self.to_client = asyncio.Queue()
 
         self.closed = False
@@ -50,10 +51,7 @@ class Connection:
 # Global state
 # =========================================
 
-connections: Dict[
-    str,
-    Connection
-] = {}
+connections: Dict[str, Connection] = {}
 
 runner_ws = None
 
@@ -81,27 +79,21 @@ def check_token(token: str):
 class OpenRequest(BaseModel):
 
     token: str
-
     connection_id: str
-
     host: str
-
     port: int
 
 
 class DataRequest(BaseModel):
 
     token: str
-
     connection_id: str
-
     data: str
 
 
 class CloseRequest(BaseModel):
 
     token: str
-
     connection_id: str
 
 
@@ -114,10 +106,8 @@ async def root():
 
     return {
         "status": "online",
-        "runner_connected":
-            runner_ws is not None,
-        "connections":
-            len(connections),
+        "runner_connected": runner_ws is not None,
+        "connections": len(connections),
     }
 
 
@@ -189,10 +179,7 @@ async def websocket_endpoint(
 
             task_map = {}
 
-            for (
-                connection_id,
-                conn
-            ) in current_connections:
+            for connection_id, conn in current_connections:
 
                 if conn.closed:
                     continue
@@ -201,9 +188,7 @@ async def websocket_endpoint(
                     conn.to_runner.get()
                 )
 
-                tasks.append(
-                    task
-                )
+                tasks.append(task)
 
                 task_map[task] = (
                     connection_id,
@@ -233,13 +218,11 @@ async def websocket_endpoint(
                 raise
 
             # Cancel losers
-
             for task in pending:
 
                 task.cancel()
 
-            # Send winner(s)
-
+            # Send winner
             for task in done:
 
                 try:
@@ -265,7 +248,7 @@ async def websocket_endpoint(
     )
 
     # =====================================
-    # Receive from Runner
+    # Receive Runner messages
     # =====================================
 
     try:
@@ -293,7 +276,7 @@ async def websocket_endpoint(
                 continue
 
             # =================================
-            # Runner -> client data
+            # Runner -> Client DATA
             # =================================
 
             if msg_type == "data":
@@ -311,7 +294,7 @@ async def websocket_endpoint(
                     })
 
             # =================================
-            # Runner closed
+            # Runner CLOSE
             # =================================
 
             elif msg_type == "close":
@@ -323,7 +306,7 @@ async def websocket_endpoint(
                 })
 
             # =================================
-            # Runner error
+            # Runner ERROR
             # =================================
 
             elif msg_type == "error":
@@ -356,16 +339,13 @@ async def websocket_endpoint(
         sender_task.cancel()
 
         try:
-
             await sender_task
-
         except BaseException:
-
             pass
 
-        # =================================
+        # =====================================
         # Remove Runner
-        # =================================
+        # =====================================
 
         async with runner_lock:
 
@@ -414,17 +394,10 @@ async def open_connection(
     ] = conn
 
     await conn.to_runner.put({
-
         "type": "open",
-
-        "connection_id":
-            connection_id,
-
-        "host":
-            req.host,
-
-        "port":
-            req.port,
+        "connection_id": connection_id,
+        "host": req.host,
+        "port": req.port,
     })
 
     print(
@@ -435,8 +408,7 @@ async def open_connection(
 
     return {
         "ok": True,
-        "connection_id":
-            connection_id,
+        "connection_id": connection_id,
     }
 
 
@@ -472,14 +444,9 @@ async def send_data(
         )
 
     await conn.to_runner.put({
-
         "type": "data",
-
-        "connection_id":
-            req.connection_id,
-
-        "data":
-            req.data,
+        "connection_id": req.connection_id,
+        "data": req.data,
     })
 
     return {
@@ -532,18 +499,15 @@ async def receive_data(
     try:
 
         message = await asyncio.wait_for(
-
             conn.to_client.get(),
-
-            timeout=25
-
+            timeout=RECV_TIMEOUT
         )
 
-        msg_type = message.get(
-            "type"
-        )
+        # =================================
+        # Close
+        # =================================
 
-        if msg_type == "close":
+        if message.get("type") == "close":
 
             conn.closed = True
 
@@ -552,7 +516,11 @@ async def receive_data(
                 None
             )
 
-        elif msg_type == "error":
+        # =================================
+        # Error
+        # =================================
+
+        elif message.get("type") == "error":
 
             conn.closed = True
 
@@ -564,6 +532,12 @@ async def receive_data(
         return message
 
     except asyncio.TimeoutError:
+
+        # =================================
+        # חשוב:
+        # לא מוחקים את החיבור.
+        # ה-client יבצע polling נוסף.
+        # =================================
 
         return {
             "type": "timeout"
@@ -597,16 +571,12 @@ async def close_connection(
             try:
 
                 await conn.to_runner.put({
-
                     "type": "close",
-
                     "connection_id":
                         req.connection_id,
-
                 })
 
             except Exception:
-
                 pass
 
         print(
@@ -615,7 +585,6 @@ async def close_connection(
         )
 
     # Idempotent
-
     return {
         "ok": True
     }

@@ -6,13 +6,11 @@ import requests
 import urllib3
 import time
 
-
 # =========================================
 # Configuration
 # =========================================
 
 RENDER_URL = "https://server-2-vddr.onrender.com"
-
 TOKEN = "131232"
 
 LOCAL_HOST = "127.0.0.1"
@@ -20,14 +18,21 @@ LOCAL_PORT = 3128
 
 BUFFER_SIZE = 16384
 
-# בגלל NetFree כרגע False.
+# בגלל NetFree
 VERIFY_SSL = False
 
-# זמן המתנה לחיבור HTTPS מול Render
-HTTP_TIMEOUT = 60
+# כמה פעמים לנסות בקשות Render
+REQUEST_RETRIES = 3
 
-# זמן המתנה לקריאת נתונים מ-Render
-RECV_TIMEOUT = 35
+# זמן timeout לחיבור HTTP
+CONNECT_TIMEOUT = 15
+
+# זמן timeout לקבלת תשובה
+READ_TIMEOUT = 30
+
+# כאשר /recv מחזיר timeout, השרת מחכה פחות זמן
+# כדי להימנע מניתוקים של reverse proxy.
+RECV_TIMEOUT_SECONDS = 10
 
 
 if not VERIFY_SSL:
@@ -37,62 +42,76 @@ if not VERIFY_SSL:
 
 
 # =========================================
-# HTTP Session Factory
+# HTTP helpers
 # =========================================
 
-def create_session():
+def render_request(method, path, **kwargs):
     """
-    יוצר Session נפרד לכל thread.
-    זה בטוח יותר מלהשתמש באותו requests.Session
-    מכל החיבורים במקביל.
+    כל בקשה ל-Render מקבלת Session חדש.
+    זה מונע בעיות thread-safety של requests.Session.
     """
 
-    session = requests.Session()
-
-    # לא להשתמש ב-proxy שמוגדר ב-Windows/environment.
-    session.trust_env = False
-
-    return session
-
-
-# =========================================
-# Render POST
-# =========================================
-
-def render_post(path, json_data):
     url = RENDER_URL + path
 
-    session = create_session()
-
-    response = session.post(
-        url,
-        json=json_data,
-        timeout=HTTP_TIMEOUT,
-        verify=VERIFY_SSL
+    timeout = kwargs.pop(
+        "timeout",
+        (CONNECT_TIMEOUT, READ_TIMEOUT)
     )
 
-    response.raise_for_status()
+    last_error = None
+
+    for attempt in range(REQUEST_RETRIES):
+
+        try:
+            response = requests.request(
+                method,
+                url,
+                timeout=timeout,
+                verify=VERIFY_SSL,
+                headers={
+                    "Connection": "close",
+                    "User-Agent": "HTTPS-Tunnel-Client/1.0",
+                },
+                **kwargs
+            )
+
+            response.raise_for_status()
+
+            return response
+
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ) as e:
+
+            last_error = e
+
+            if attempt + 1 < REQUEST_RETRIES:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+
+            raise last_error
+
+
+def render_post(path, json_data):
+    response = render_request(
+        "POST",
+        path,
+        json=json_data,
+        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
+    )
 
     return response.json()
 
 
-# =========================================
-# Render GET
-# =========================================
-
 def render_get(path, params=None):
-    url = RENDER_URL + path
-
-    session = create_session()
-
-    response = session.get(
-        url,
+    response = render_request(
+        "GET",
+        path,
         params=params,
-        timeout=RECV_TIMEOUT,
-        verify=VERIFY_SSL
+        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
     )
-
-    response.raise_for_status()
 
     return response.json()
 
@@ -165,6 +184,8 @@ def receive_loop(
     stop_event
 ):
 
+    consecutive_errors = 0
+
     try:
 
         while not stop_event.is_set():
@@ -178,52 +199,124 @@ def receive_loop(
                     }
                 )
 
+                # הצלחה
+                consecutive_errors = 0
+
             except requests.HTTPError as e:
 
-                if (
-                    e.response is not None
-                    and e.response.status_code == 404
-                ):
+                status = (
+                    e.response.status_code
+                    if e.response is not None
+                    else None
+                )
+
+                # החיבור באמת לא קיים
+                if status in (404, 410):
+
+                    print(
+                        f"[{connection_id}] "
+                        f"Render connection no longer exists "
+                        f"({status})"
+                    )
+
                     break
 
-                if (
-                    e.response is not None
-                    and e.response.status_code in (410, 503)
-                ):
-                    time.sleep(0.2)
+                # שגיאות זמניות של Render
+                if status in (502, 503, 504):
+
+                    consecutive_errors += 1
+
+                    print(
+                        f"[{connection_id}] "
+                        f"temporary Render error {status} "
+                        f"(retry {consecutive_errors})"
+                    )
+
+                    if consecutive_errors >= 10:
+                        break
+
+                    time.sleep(
+                        min(
+                            0.5 * consecutive_errors,
+                            5
+                        )
+                    )
+
                     continue
 
                 raise
 
             except (
-                requests.ConnectionError,
-                requests.Timeout
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
             ) as e:
 
-                if stop_event.is_set():
-                    break
+                consecutive_errors += 1
 
                 print(
                     f"[{connection_id}] "
-                    f"Render receive connection error:",
-                    e
+                    f"Render receive connection error: "
+                    f"{e} "
+                    f"(retry {consecutive_errors})"
                 )
 
-                time.sleep(0.5)
+                # חשוב:
+                # לא סוגרים מיד את ה-TCP המקומי.
+                # Render יכול להתנתק זמנית.
+                if consecutive_errors >= 15:
+
+                    print(
+                        f"[{connection_id}] "
+                        f"Too many Render errors"
+                    )
+
+                    break
+
+                time.sleep(
+                    min(
+                        0.5 * consecutive_errors,
+                        5
+                    )
+                )
+
+                continue
+
+            except Exception as e:
+
+                consecutive_errors += 1
+
+                print(
+                    f"[{connection_id}] "
+                    f"receive error: {e}"
+                )
+
+                if consecutive_errors >= 10:
+                    break
+
+                time.sleep(1)
+
+                continue
+
+            # =====================================
+            # Process Render response
+            # =====================================
+
+            if not isinstance(result, dict):
                 continue
 
             msg_type = result.get("type")
 
-            # =================================
+            # =====================================
             # No data yet
-            # =================================
+            # =====================================
 
             if msg_type == "timeout":
                 continue
 
-            # =================================
+            # =====================================
             # Data from Runner
-            # =================================
+            # =====================================
 
             if msg_type == "data":
 
@@ -232,72 +325,59 @@ def receive_loop(
                     ""
                 )
 
-                if not encoded:
-                    continue
-
-                try:
-
-                    data = base64.b64decode(
-                        encoded
-                    )
-
-                except Exception as e:
-
-                    print(
-                        f"[{connection_id}] "
-                        f"Base64 decode error:",
-                        e
-                    )
-
-                    break
-
-                if data:
+                if encoded:
 
                     try:
 
-                        client_socket.sendall(
-                            data
+                        data = base64.b64decode(
+                            encoded
                         )
 
+                        if data:
+
+                            client_socket.sendall(
+                                data
+                            )
+
                     except (
-                        ConnectionResetError,
                         BrokenPipeError,
-                        OSError
-                    ):
+                        ConnectionResetError,
+                        OSError,
+                    ) as e:
+
+                        print(
+                            f"[{connection_id}] "
+                            f"Local socket closed: {e}"
+                        )
 
                         break
 
-            # =================================
-            # Remote close
-            # =================================
+            # =====================================
+            # Remote connection closed
+            # =====================================
 
             elif msg_type == "close":
 
+                print(
+                    f"[{connection_id}] "
+                    f"Remote connection closed"
+                )
+
                 break
 
-            # =================================
+            # =====================================
             # Remote error
-            # =================================
+            # =====================================
 
             elif msg_type == "error":
 
                 print(
                     f"[{connection_id}] "
-                    f"Remote error:",
-                    result.get("message")
+                    f"Remote error: "
+                    f"{result.get('message')}"
                 )
 
                 break
-
-    except Exception as e:
-
-        if not stop_event.is_set():
-
-            print(
-                f"[{connection_id}] "
-                f"receive error:",
-                e
-            )
 
     finally:
 
@@ -328,9 +408,7 @@ def parse_target(client_socket):
 
     while b"\r\n\r\n" not in data:
 
-        chunk = client_socket.recv(
-            4096
-        )
+        chunk = client_socket.recv(4096)
 
         if not chunk:
             return (
@@ -344,7 +422,6 @@ def parse_target(client_socket):
         data += chunk
 
         if len(data) > 65536:
-
             raise Exception(
                 "HTTP header too large"
             )
@@ -390,9 +467,9 @@ def parse_target(client_socket):
     method = parts[0].upper()
     target = parts[1]
 
-    # =====================================
+    # =========================================
     # HTTPS CONNECT
-    # =====================================
+    # =========================================
 
     if method == "CONNECT":
 
@@ -418,9 +495,9 @@ def parse_target(client_socket):
             method
         )
 
-    # =====================================
+    # =========================================
     # Normal HTTP
-    # =====================================
+    # =========================================
 
     host = None
     port = 80
@@ -432,7 +509,6 @@ def parse_target(client_socket):
         ):
 
             host = line[5:].strip()
-
             break
 
     if not host:
@@ -475,8 +551,6 @@ def handle_client(client_socket):
 
     stop_event = threading.Event()
 
-    receiver = None
-
     try:
 
         (
@@ -499,9 +573,9 @@ def handle_client(client_socket):
             f"{host}:{port}"
         )
 
-        # =================================
-        # Open on Render
-        # =================================
+        # =====================================
+        # Open connection on Render
+        # =====================================
 
         render_post(
             "/open",
@@ -513,26 +587,33 @@ def handle_client(client_socket):
             }
         )
 
-        # =================================
+        # =====================================
         # HTTPS CONNECT
-        # =================================
+        # =====================================
 
         if is_connect:
 
             client_socket.sendall(
                 b"HTTP/1.1 200 Connection Established\r\n"
                 b"Proxy-Agent: Python-HTTPS-Tunnel\r\n"
+                b"Connection: keep-alive\r\n"
                 b"\r\n"
             )
 
-        # =================================
+        # =====================================
         # Normal HTTP
-        # =================================
+        # =====================================
 
         else:
 
+            # עבור HTTP רגיל:
+            # remaining מכיל מידע שכבר הגיע אחרי headers.
+            #
+            # אנחנו שולחים בקשה מינימלית תקינה.
             request = (
-                f"{method} http://{host}/ HTTP/1.1\r\n"
+                f"{method} "
+                f"http://{host}/ "
+                f"HTTP/1.1\r\n"
                 f"Host: {host}\r\n"
                 f"Connection: close\r\n"
                 f"\r\n"
@@ -545,10 +626,9 @@ def handle_client(client_socket):
                 request
             )
 
-        # =================================
-        # Start receiver BEFORE sending
-        # remaining bytes
-        # =================================
+        # =====================================
+        # Start receiver
+        # =====================================
 
         receiver = threading.Thread(
             target=receive_loop,
@@ -562,9 +642,9 @@ def handle_client(client_socket):
 
         receiver.start()
 
-        # =================================
-        # Data already buffered
-        # =================================
+        # =====================================
+        # Send buffered data
+        # =====================================
 
         if remaining:
 
@@ -573,9 +653,9 @@ def handle_client(client_socket):
                 remaining
             )
 
-        # =================================
+        # =====================================
         # Browser -> Render
-        # =================================
+        # =====================================
 
         client_socket.settimeout(None)
 
@@ -589,8 +669,8 @@ def handle_client(client_socket):
 
             except (
                 ConnectionResetError,
-                ConnectionAbortedError,
-                OSError
+                BrokenPipeError,
+                OSError,
             ):
 
                 break
@@ -598,31 +678,10 @@ def handle_client(client_socket):
             if not data:
                 break
 
-            try:
-
-                send_data(
-                    connection_id,
-                    data
-                )
-
-            except requests.HTTPError as e:
-
-                if (
-                    e.response is not None
-                    and e.response.status_code
-                    in (404, 410)
-                ):
-                    break
-
-                raise
-
-    except (
-        ConnectionResetError,
-        ConnectionAbortedError,
-        BrokenPipeError
-    ):
-
-        pass
+            send_data(
+                connection_id,
+                data
+            )
 
     except Exception as e:
 
@@ -630,8 +689,7 @@ def handle_client(client_socket):
 
             print(
                 f"[{connection_id}] "
-                f"error:",
-                e
+                f"error: {e}"
             )
 
     finally:
@@ -643,18 +701,14 @@ def handle_client(client_socket):
         )
 
         try:
-
             client_socket.shutdown(
                 socket.SHUT_RDWR
             )
-
         except Exception:
             pass
 
         try:
-
             client_socket.close()
-
         except Exception:
             pass
 
@@ -683,7 +737,7 @@ def start_proxy():
         )
     )
 
-    server.listen(200)
+    server.listen(100)
 
     print()
     print(
