@@ -28,30 +28,38 @@ TOKEN = os.environ.get(
     "CHANGE_ME"
 )
 
-RECV_TIMEOUT = 10
+# קצר כדי לא להשאיר HTTP request פתוח
+# יותר מדי זמן על Render.
+RECV_TIMEOUT = 5
 
 
 # =========================================
-# Connection object
+# Connection
 # =========================================
 
 class Connection:
 
     def __init__(self):
 
-        self.to_runner = asyncio.Queue()
-        self.to_client = asyncio.Queue()
+        self.to_runner = asyncio.Queue(
+            maxsize=100
+        )
+
+        self.to_client = asyncio.Queue(
+            maxsize=100
+        )
 
         self.closed = False
-
-        self.lock = asyncio.Lock()
 
 
 # =========================================
 # Global state
 # =========================================
 
-connections: Dict[str, Connection] = {}
+connections: Dict[
+    str,
+    Connection
+] = {}
 
 runner_ws = None
 
@@ -62,7 +70,9 @@ runner_lock = asyncio.Lock()
 # Authentication
 # =========================================
 
-def check_token(token: str):
+def check_token(
+    token: str
+):
 
     if token != TOKEN:
 
@@ -73,7 +83,7 @@ def check_token(token: str):
 
 
 # =========================================
-# Request models
+# Models
 # =========================================
 
 class OpenRequest(BaseModel):
@@ -106,13 +116,17 @@ async def root():
 
     return {
         "status": "online",
-        "runner_connected": runner_ws is not None,
-        "connections": len(connections),
+
+        "runner_connected":
+            runner_ws is not None,
+
+        "connections":
+            len(connections),
     }
 
 
 # =========================================
-# WebSocket -> Runner
+# WebSocket
 # =========================================
 
 @app.websocket("/ws")
@@ -142,32 +156,32 @@ async def websocket_endpoint(
 
     async with runner_lock:
 
-        if runner_ws is not None:
-
-            try:
-                await runner_ws.close()
-            except Exception:
-                pass
+        old_ws = runner_ws
 
         runner_ws = websocket
+
+        if old_ws is not None:
+
+            try:
+
+                await old_ws.close()
+
+            except Exception:
+                pass
 
     print(
         "Runner connected"
     )
 
     # =====================================
-    # Sender task
+    # Sender
     # =====================================
 
     async def sender():
 
         while True:
 
-            current_connections = list(
-                connections.items()
-            )
-
-            if not current_connections:
+            if not connections:
 
                 await asyncio.sleep(
                     0.05
@@ -179,7 +193,16 @@ async def websocket_endpoint(
 
             task_map = {}
 
-            for connection_id, conn in current_connections:
+            # ---------------------------------
+            # One queue reader per connection
+            # ---------------------------------
+
+            for (
+                connection_id,
+                conn
+            ) in list(
+                connections.items()
+            ):
 
                 if conn.closed:
                     continue
@@ -213,16 +236,23 @@ async def websocket_endpoint(
             except asyncio.CancelledError:
 
                 for task in tasks:
+
                     task.cancel()
 
                 raise
 
-            # Cancel losers
+            # ---------------------------------
+            # Cancel remaining queue waits
+            # ---------------------------------
+
             for task in pending:
 
                 task.cancel()
 
-            # Send winner
+            # ---------------------------------
+            # Send messages
+            # ---------------------------------
+
             for task in done:
 
                 try:
@@ -239,7 +269,12 @@ async def websocket_endpoint(
                         message
                     )
 
-                except Exception:
+                except Exception as e:
+
+                    print(
+                        "WebSocket send error:",
+                        e
+                    )
 
                     return
 
@@ -248,7 +283,7 @@ async def websocket_endpoint(
     )
 
     # =====================================
-    # Receive Runner messages
+    # Receive from Runner
     # =====================================
 
     try:
@@ -266,6 +301,7 @@ async def websocket_endpoint(
             )
 
             if not connection_id:
+
                 continue
 
             conn = connections.get(
@@ -273,10 +309,11 @@ async def websocket_endpoint(
             )
 
             if not conn:
+
                 continue
 
             # =================================
-            # Runner -> Client DATA
+            # DATA
             # =================================
 
             if msg_type == "data":
@@ -288,38 +325,60 @@ async def websocket_endpoint(
 
                 if data:
 
-                    await conn.to_client.put({
-                        "type": "data",
-                        "data": data,
-                    })
+                    try:
+
+                        await conn.to_client.put({
+                            "type": "data",
+                            "data": data,
+                        })
+
+                    except Exception as e:
+
+                        print(
+                            f"[{connection_id}] "
+                            f"queue error:",
+                            e
+                        )
 
             # =================================
-            # Runner CLOSE
+            # CLOSE
             # =================================
 
             elif msg_type == "close":
 
                 conn.closed = True
 
-                await conn.to_client.put({
-                    "type": "close"
-                })
+                try:
+
+                    await conn.to_client.put({
+                        "type": "close"
+                    })
+
+                except Exception:
+                    pass
 
             # =================================
-            # Runner ERROR
+            # ERROR
             # =================================
 
             elif msg_type == "error":
 
                 conn.closed = True
 
-                await conn.to_client.put({
-                    "type": "error",
-                    "message": message.get(
-                        "message",
-                        "Runner error"
-                    )
-                })
+                try:
+
+                    await conn.to_client.put({
+                        "type": "error",
+
+                        "message":
+                            message.get(
+                                "message",
+                                "Runner error"
+                            )
+                    })
+
+                except Exception:
+                    pass
 
     except WebSocketDisconnect:
 
@@ -339,13 +398,11 @@ async def websocket_endpoint(
         sender_task.cancel()
 
         try:
+
             await sender_task
+
         except BaseException:
             pass
-
-        # =====================================
-        # Remove Runner
-        # =====================================
 
         async with runner_lock:
 
@@ -359,7 +416,7 @@ async def websocket_endpoint(
 
 
 # =========================================
-# Open connection
+# Open
 # =========================================
 
 @app.post("/open")
@@ -380,6 +437,10 @@ async def open_connection(
 
     connection_id = req.connection_id
 
+    # -------------------------------------
+    # Duplicate
+    # -------------------------------------
+
     if connection_id in connections:
 
         raise HTTPException(
@@ -394,10 +455,17 @@ async def open_connection(
     ] = conn
 
     await conn.to_runner.put({
+
         "type": "open",
-        "connection_id": connection_id,
-        "host": req.host,
-        "port": req.port,
+
+        "connection_id":
+            connection_id,
+
+        "host":
+            req.host,
+
+        "port":
+            req.port,
     })
 
     print(
@@ -408,12 +476,14 @@ async def open_connection(
 
     return {
         "ok": True,
-        "connection_id": connection_id,
+
+        "connection_id":
+            connection_id
     }
 
 
 # =========================================
-# Send data
+# DATA
 # =========================================
 
 @app.post("/data")
@@ -443,11 +513,25 @@ async def send_data(
             detail="Connection closed"
         )
 
-    await conn.to_runner.put({
-        "type": "data",
-        "connection_id": req.connection_id,
-        "data": req.data,
-    })
+    try:
+
+        await conn.to_runner.put({
+
+            "type": "data",
+
+            "connection_id":
+                req.connection_id,
+
+            "data":
+                req.data,
+        })
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=503,
+            detail=str(e)
+        )
 
     return {
         "ok": True
@@ -455,7 +539,7 @@ async def send_data(
 
 
 # =========================================
-# Receive data
+# RECEIVE
 # =========================================
 
 @app.get(
@@ -481,10 +565,6 @@ async def receive_data(
             detail="Connection not found"
         )
 
-    # =====================================
-    # Already closed
-    # =====================================
-
     if conn.closed:
 
         connections.pop(
@@ -499,15 +579,19 @@ async def receive_data(
     try:
 
         message = await asyncio.wait_for(
+
             conn.to_client.get(),
+
             timeout=RECV_TIMEOUT
         )
 
         # =================================
-        # Close
+        # CLOSE
         # =================================
 
-        if message.get("type") == "close":
+        if message.get(
+            "type"
+        ) == "close":
 
             conn.closed = True
 
@@ -517,10 +601,12 @@ async def receive_data(
             )
 
         # =================================
-        # Error
+        # ERROR
         # =================================
 
-        elif message.get("type") == "error":
+        elif message.get(
+            "type"
+        ) == "error":
 
             conn.closed = True
 
@@ -533,19 +619,13 @@ async def receive_data(
 
     except asyncio.TimeoutError:
 
-        # =================================
-        # חשוב:
-        # לא מוחקים את החיבור.
-        # ה-client יבצע polling נוסף.
-        # =================================
-
         return {
             "type": "timeout"
         }
 
 
 # =========================================
-# Close connection
+# CLOSE
 # =========================================
 
 @app.post("/close")
@@ -566,25 +646,24 @@ async def close_connection(
 
         conn.closed = True
 
-        if runner_ws is not None:
+        try:
 
-            try:
+            await conn.to_runner.put({
 
-                await conn.to_runner.put({
-                    "type": "close",
-                    "connection_id":
-                        req.connection_id,
-                })
+                "type": "close",
 
-            except Exception:
-                pass
+                "connection_id":
+                    req.connection_id,
+            })
+
+        except Exception:
+            pass
 
         print(
             f"[CLOSE] "
             f"{req.connection_id}"
         )
 
-    # Idempotent
     return {
         "ok": True
     }
