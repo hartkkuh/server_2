@@ -2,44 +2,33 @@ import socket
 import threading
 import uuid
 import base64
-import requests
-import urllib3
 import time
 
+import requests
+import urllib3
 
-# =========================================
+
+# =========================================================
 # Configuration
-# =========================================
+# =========================================================
 
 RENDER_URL = "https://server-2-vddr.onrender.com"
 
 TOKEN = "131232"
 
 LOCAL_HOST = "127.0.0.1"
+
 LOCAL_PORT = 3128
 
 BUFFER_SIZE = 16384
 
-# NetFree
 VERIFY_SSL = False
 
-# =========================================
-# Timeouts
-# =========================================
+REQUEST_RETRIES = 5
 
-CONNECT_TIMEOUT = 15
+CONNECT_TIMEOUT = 20
 
-# לא לחכות 30 שניות ל-/recv.
-RECV_TIMEOUT_SECONDS = 5
-
-# Timeout לבקשות רגילות
-HTTP_READ_TIMEOUT = 30
-
-# =========================================
-# Retry
-# =========================================
-
-MAX_RECV_ERRORS = 30
+READ_TIMEOUT = 40
 
 
 if not VERIFY_SSL:
@@ -49,59 +38,45 @@ if not VERIFY_SSL:
     )
 
 
-# =========================================
-# HTTP request to Render
-# =========================================
+# =========================================================
+# Render HTTP request
+# =========================================================
 
 def render_request(
     method,
     path,
-    *,
-    json_data=None,
-    params=None,
-    timeout=None,
-    retries=0
+    **kwargs
 ):
 
     url = RENDER_URL + path
 
-    if timeout is None:
-
-        timeout = (
+    timeout = kwargs.pop(
+        "timeout",
+        (
             CONNECT_TIMEOUT,
-            HTTP_READ_TIMEOUT
+            READ_TIMEOUT
         )
+    )
 
     last_error = None
 
-    for attempt in range(retries + 1):
+    for attempt in range(
+        REQUEST_RETRIES
+    ):
 
         try:
 
             response = requests.request(
                 method,
                 url,
-
-                json=json_data,
-
-                params=params,
-
                 timeout=timeout,
-
                 verify=VERIFY_SSL,
-
                 headers={
+                    "Connection": "close",
                     "User-Agent":
-                        "HTTPS-Tunnel-Client/2.0",
-
-                    "Accept":
-                        "application/json",
-
-                    # לא לסגור בכוח.
-                    # מאפשר ל-requests לנהל HTTP.
-                    "Connection":
-                        "keep-alive",
-                }
+                        "HTTPS-Tunnel-Proxy/2.1",
+                },
+                **kwargs
             )
 
             response.raise_for_status()
@@ -116,48 +91,41 @@ def render_request(
 
             last_error = e
 
-            if attempt < retries:
+            if attempt + 1 < REQUEST_RETRIES:
 
-                delay = min(
-                    0.5 * (attempt + 1),
-                    3
+                time.sleep(
+                    min(
+                        0.5 * (attempt + 1),
+                        3
+                    )
                 )
-
-                time.sleep(delay)
 
                 continue
 
             raise last_error
 
 
-# =========================================
-# POST helper
-# =========================================
+# =========================================================
+# POST
+# =========================================================
 
 def render_post(
     path,
-    json_data,
-    *,
-    retries=0
+    data
 ):
 
     response = render_request(
         "POST",
         path,
-        json_data=json_data,
-        timeout=(
-            CONNECT_TIMEOUT,
-            HTTP_READ_TIMEOUT
-        ),
-        retries=retries
+        json=data
     )
 
     return response.json()
 
 
-# =========================================
-# GET helper
-# =========================================
+# =========================================================
+# GET
+# =========================================================
 
 def render_get(
     path,
@@ -167,20 +135,15 @@ def render_get(
     response = render_request(
         "GET",
         path,
-        params=params,
-        timeout=(
-            CONNECT_TIMEOUT,
-            RECV_TIMEOUT_SECONDS + 10
-        ),
-        retries=0
+        params=params
     )
 
     return response.json()
 
 
-# =========================================
-# Send data
-# =========================================
+# =========================================================
+# SEND DATA
+# =========================================================
 
 def send_data(
     connection_id,
@@ -188,47 +151,26 @@ def send_data(
 ):
 
     if not data:
-        return False
+        return
 
     encoded = base64.b64encode(
         data
     ).decode("ascii")
 
-    try:
-
-        render_post(
-            "/data",
-            {
-                "token": TOKEN,
-
-                "connection_id":
-                    connection_id,
-
-                "data":
-                    encoded,
-            },
-
-            # IMPORTANT:
-            # אין retry אוטומטי ל-data.
-            # אחרת עלול להיות duplicate TCP data.
-            retries=0
-        )
-
-        return True
-
-    except Exception as e:
-
-        print(
-            f"[{connection_id}] "
-            f"Send data error: {e}"
-        )
-
-        return False
+    render_post(
+        "/data",
+        {
+            "token": TOKEN,
+            "connection_id":
+                connection_id,
+            "data": encoded,
+        }
+    )
 
 
-# =========================================
-# Close remote connection
-# =========================================
+# =========================================================
+# CLOSE
+# =========================================================
 
 def close_remote(
     connection_id
@@ -238,28 +180,24 @@ def close_remote(
 
         render_post(
             "/close",
-
             {
                 "token": TOKEN,
-
                 "connection_id":
                     connection_id,
-            },
-
-            retries=1
+            }
         )
 
     except Exception as e:
 
         print(
             f"[{connection_id}] "
-            f"Close remote error: {e}"
+            f"close error: {e}"
         )
 
 
-# =========================================
-# Receive data from Render
-# =========================================
+# =========================================================
+# RECEIVE FROM RENDER
+# =========================================================
 
 def receive_loop(
     client_socket,
@@ -267,7 +205,7 @@ def receive_loop(
     stop_event
 ):
 
-    consecutive_errors = 0
+    errors = 0
 
     try:
 
@@ -277,17 +215,12 @@ def receive_loop(
 
                 result = render_get(
                     f"/recv/{connection_id}",
-
                     {
                         "token": TOKEN
                     }
                 )
 
-                consecutive_errors = 0
-
-            # =================================
-            # HTTP error
-            # =================================
+                errors = 0
 
             except requests.HTTPError as e:
 
@@ -297,8 +230,6 @@ def receive_loop(
                     else None
                 )
 
-                # Connection really gone
-
                 if status in (
                     404,
                     410
@@ -306,13 +237,11 @@ def receive_loop(
 
                     print(
                         f"[{connection_id}] "
-                        f"Remote connection gone "
+                        f"Remote connection disappeared "
                         f"({status})"
                     )
 
                     break
-
-                # Temporary Render error
 
                 if status in (
                     502,
@@ -320,43 +249,27 @@ def receive_loop(
                     504
                 ):
 
-                    consecutive_errors += 1
+                    errors += 1
 
                     print(
                         f"[{connection_id}] "
                         f"Render HTTP {status} "
-                        f"retry={consecutive_errors}"
+                        f"(retry {errors})"
                     )
 
-                    if consecutive_errors >= MAX_RECV_ERRORS:
-
-                        print(
-                            f"[{connection_id}] "
-                            f"Too many Render errors"
-                        )
-
+                    if errors >= 20:
                         break
 
                     time.sleep(
                         min(
-                            0.5 *
-                            consecutive_errors,
+                            errors * 0.5,
                             5
                         )
                     )
 
                     continue
 
-                print(
-                    f"[{connection_id}] "
-                    f"HTTP error: {e}"
-                )
-
-                break
-
-            # =================================
-            # Network error
-            # =================================
+                raise
 
             except (
                 requests.exceptions.ConnectionError,
@@ -364,79 +277,58 @@ def receive_loop(
                 requests.exceptions.ChunkedEncodingError,
             ) as e:
 
-                consecutive_errors += 1
+                errors += 1
 
                 print(
                     f"[{connection_id}] "
                     f"Render receive error: "
                     f"{e} "
-                    f"retry={consecutive_errors}"
+                    f"(retry {errors})"
                 )
 
-                # לא סוגרים מיד.
-                # נותנים ל-Render להתאושש.
-
-                if consecutive_errors >= MAX_RECV_ERRORS:
+                if errors >= 20:
 
                     print(
                         f"[{connection_id}] "
-                        f"Too many receive errors"
+                        f"Too many errors"
                     )
 
                     break
 
                 time.sleep(
                     min(
-                        0.5 *
-                        consecutive_errors,
+                        errors * 0.5,
                         5
                     )
                 )
 
                 continue
 
-            except Exception as e:
-
-                consecutive_errors += 1
-
-                print(
-                    f"[{connection_id}] "
-                    f"Receive error: {e}"
-                )
-
-                if consecutive_errors >= 10:
-                    break
-
-                time.sleep(1)
-
-                continue
-
-            # =================================
-            # Validate result
-            # =================================
+            # =================================================
+            # Process message
+            # =================================================
 
             if not isinstance(
                 result,
                 dict
             ):
-
                 continue
 
             msg_type = result.get(
                 "type"
             )
 
-            # =================================
+            # =================================================
             # Timeout
-            # =================================
+            # =================================================
 
             if msg_type == "timeout":
 
                 continue
 
-            # =================================
+            # =================================================
             # DATA
-            # =================================
+            # =================================================
 
             if msg_type == "data":
 
@@ -446,7 +338,6 @@ def receive_loop(
                 )
 
                 if not encoded:
-
                     continue
 
                 try:
@@ -474,9 +365,9 @@ def receive_loop(
 
                     break
 
-            # =================================
+            # =================================================
             # CLOSE
-            # =================================
+            # =================================================
 
             elif msg_type == "close":
 
@@ -487,9 +378,9 @@ def receive_loop(
 
                 break
 
-            # =================================
+            # =================================================
             # ERROR
-            # =================================
+            # =================================================
 
             elif msg_type == "error":
 
@@ -506,31 +397,29 @@ def receive_loop(
         stop_event.set()
 
         try:
-
             client_socket.shutdown(
                 socket.SHUT_RDWR
             )
-
         except Exception:
             pass
 
         try:
-
             client_socket.close()
-
         except Exception:
             pass
 
 
-# =========================================
-# Parse browser request
-# =========================================
+# =========================================================
+# Parse CONNECT
+# =========================================================
 
 def parse_target(
     client_socket
 ):
 
-    client_socket.settimeout(15)
+    client_socket.settimeout(
+        20
+    )
 
     data = b""
 
@@ -541,15 +430,7 @@ def parse_target(
         )
 
         if not chunk:
-
-            return (
-                None,
-                None,
-                False,
-                b"",
-                None,
-                None
-            )
+            return None, None, False, b"", None
 
         data += chunk
 
@@ -576,38 +457,21 @@ def parse_target(
     ).split("\r\n")
 
     if not lines:
+        return None, None, False, b"", None
 
-        return (
-            None,
-            None,
-            False,
-            b"",
-            None,
-            None
-        )
-
-    request_line = lines[0]
-
-    parts = request_line.split()
+    parts = lines[0].split()
 
     if len(parts) < 2:
 
-        return (
-            None,
-            None,
-            False,
-            b"",
-            None,
-            None
-        )
+        return None, None, False, b"", None
 
     method = parts[0].upper()
 
     target = parts[1]
 
-    # =====================================
+    # =====================================================
     # HTTPS CONNECT
-    # =====================================
+    # =====================================================
 
     if method == "CONNECT":
 
@@ -623,6 +487,7 @@ def parse_target(
         else:
 
             host = target
+
             port = 443
 
         return (
@@ -630,15 +495,15 @@ def parse_target(
             port,
             True,
             remaining,
-            method,
-            None
+            method
         )
 
-    # =====================================
-    # Normal HTTP
-    # =====================================
+    # =====================================================
+    # HTTP
+    # =====================================================
 
     host = None
+
     port = 80
 
     for line in lines[1:]:
@@ -658,8 +523,7 @@ def parse_target(
             None,
             False,
             remaining,
-            method,
-            None
+            method
         )
 
     if ":" in host:
@@ -678,14 +542,13 @@ def parse_target(
         port,
         False,
         remaining,
-        method,
-        target
+        method
     )
 
 
-# =========================================
-# Handle local client
-# =========================================
+# =========================================================
+# Client handler
+# =========================================================
 
 def handle_client(
     client_socket
@@ -704,51 +567,39 @@ def handle_client(
             port,
             is_connect,
             remaining,
-            method,
-            target
+            method
         ) = parse_target(
             client_socket
         )
 
         if not host:
 
-            client_socket.close()
-
             return
 
         print(
             f"[{connection_id}] "
-            f"{method} "
+            f"{'CONNECT' if is_connect else method} "
             f"{host}:{port}"
         )
 
-        # =================================
-        # Open Render connection
-        # =================================
+        # =================================================
+        # OPEN
+        # =================================================
 
         render_post(
             "/open",
-
             {
                 "token": TOKEN,
-
                 "connection_id":
                     connection_id,
-
                 "host": host,
-
                 "port": port,
-            },
-
-            # Open is safe to retry
-            # because server rejects duplicates.
-
-            retries=3
+            }
         )
 
-        # =================================
-        # HTTPS
-        # =================================
+        # =================================================
+        # CONNECT response
+        # =================================================
 
         if is_connect:
 
@@ -759,22 +610,15 @@ def handle_client(
                 b"\r\n"
             )
 
-        # =================================
+        # =================================================
         # HTTP
-        # =================================
+        # =================================================
 
         else:
 
-            # במקרה HTTP רגיל, צריך לשמור
-            # את ה-path המקורי.
-
-            if not target:
-
-                target = "/"
-
             request = (
                 f"{method} "
-                f"{target} "
+                f"http://{host}/ "
                 f"HTTP/1.1\r\n"
                 f"Host: {host}\r\n"
                 f"Connection: close\r\n"
@@ -783,49 +627,45 @@ def handle_client(
                 "iso-8859-1"
             )
 
-            if not send_data(
+            send_data(
                 connection_id,
                 request
-            ):
+            )
 
-                return
-
-        # =================================
-        # Receiver thread
-        # =================================
+        # =================================================
+        # Start receiver
+        # =================================================
 
         receiver = threading.Thread(
             target=receive_loop,
-
             args=(
                 client_socket,
                 connection_id,
                 stop_event
             ),
-
             daemon=True
         )
 
         receiver.start()
 
-        # =================================
+        # =================================================
         # Send buffered data
-        # =================================
+        # =================================================
 
         if remaining:
 
-            if not send_data(
+            send_data(
                 connection_id,
                 remaining
-            ):
+            )
 
-                return
-
-        # =================================
+        # =================================================
         # Browser -> Render
-        # =================================
+        # =================================================
 
-        client_socket.settimeout(None)
+        client_socket.settimeout(
+            None
+        )
 
         while not stop_event.is_set():
 
@@ -844,22 +684,32 @@ def handle_client(
                 break
 
             if not data:
-
                 break
 
-            if not send_data(
-                connection_id,
-                data
-            ):
+            try:
+
+                send_data(
+                    connection_id,
+                    data
+                )
+
+            except Exception as e:
+
+                print(
+                    f"[{connection_id}] "
+                    f"send error: {e}"
+                )
 
                 break
 
     except Exception as e:
 
-        print(
-            f"[{connection_id}] "
-            f"error: {e}"
-        )
+        if not stop_event.is_set():
+
+            print(
+                f"[{connection_id}] "
+                f"error: {e}"
+            )
 
     finally:
 
@@ -886,9 +736,9 @@ def handle_client(
             pass
 
 
-# =========================================
+# =========================================================
 # Start proxy
-# =========================================
+# =========================================================
 
 def start_proxy():
 
@@ -910,14 +760,16 @@ def start_proxy():
         )
     )
 
-    server.listen(200)
+    server.listen(
+        100
+    )
 
     print()
     print(
         "================================="
     )
     print(
-        " HTTPS Tunnel Proxy v2"
+        " HTTPS Tunnel Proxy v2.1"
     )
     print(
         "================================="
@@ -950,11 +802,7 @@ def start_proxy():
 
             thread = threading.Thread(
                 target=handle_client,
-
-                args=(
-                    client_socket,
-                ),
-
+                args=(client_socket,),
                 daemon=True
             )
 
@@ -974,9 +822,9 @@ def start_proxy():
             pass
 
 
-# =========================================
+# =========================================================
 # Main
-# =========================================
+# =========================================================
 
 if __name__ == "__main__":
 

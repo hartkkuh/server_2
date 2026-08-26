@@ -1,93 +1,69 @@
 import os
 import asyncio
-from typing import Dict
+from typing import Dict, Optional
 
-from fastapi import (
-    FastAPI,
-    WebSocket,
-    WebSocketDisconnect,
-    HTTPException
-)
-
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from pydantic import BaseModel
 
 
-# =========================================
+# =========================================================
 # FastAPI
-# =========================================
+# =========================================================
 
 app = FastAPI()
 
 
-# =========================================
+# =========================================================
 # Configuration
-# =========================================
+# =========================================================
 
-TOKEN = os.environ.get(
-    "PROXY_TOKEN",
-    "CHANGE_ME"
-)
+TOKEN = os.environ.get("PROXY_TOKEN", "CHANGE_ME")
 
-# קצר כדי לא להשאיר HTTP request פתוח
-# יותר מדי זמן על Render.
-RECV_TIMEOUT = 5
+RECV_TIMEOUT = 10
 
 
-# =========================================
+# =========================================================
 # Connection
-# =========================================
+# =========================================================
 
 class Connection:
 
     def __init__(self):
-
-        self.to_runner = asyncio.Queue(
-            maxsize=100
-        )
-
-        self.to_client = asyncio.Queue(
-            maxsize=100
-        )
-
+        self.to_client = asyncio.Queue()
         self.closed = False
 
 
-# =========================================
+# =========================================================
 # Global state
-# =========================================
+# =========================================================
 
-connections: Dict[
-    str,
-    Connection
-] = {}
+connections: Dict[str, Connection] = {}
 
-runner_ws = None
+runner_ws: Optional[WebSocket] = None
+
+runner_queue = asyncio.Queue()
 
 runner_lock = asyncio.Lock()
 
 
-# =========================================
+# =========================================================
 # Authentication
-# =========================================
+# =========================================================
 
-def check_token(
-    token: str
-):
+def check_token(token: str):
 
     if token != TOKEN:
-
         raise HTTPException(
             status_code=401,
             detail="Invalid token"
         )
 
 
-# =========================================
+# =========================================================
 # Models
-# =========================================
+# =========================================================
 
 class OpenRequest(BaseModel):
-
     token: str
     connection_id: str
     host: str
@@ -95,39 +71,54 @@ class OpenRequest(BaseModel):
 
 
 class DataRequest(BaseModel):
-
     token: str
     connection_id: str
     data: str
 
 
 class CloseRequest(BaseModel):
-
     token: str
     connection_id: str
 
 
-# =========================================
+# =========================================================
 # Root
-# =========================================
+# =========================================================
 
 @app.get("/")
 async def root():
 
     return {
         "status": "online",
-
-        "runner_connected":
-            runner_ws is not None,
-
-        "connections":
-            len(connections),
+        "runner_connected": runner_ws is not None,
+        "connections": len(connections),
     }
 
 
-# =========================================
-# WebSocket
-# =========================================
+# =========================================================
+# Runner sender
+# =========================================================
+
+async def runner_sender(websocket: WebSocket):
+
+    while True:
+
+        message = await runner_queue.get()
+
+        try:
+
+            await websocket.send_json(message)
+
+        except Exception:
+
+            # אם ה-WebSocket נפל,
+            # לא מנסים לשלוח שוב מכאן.
+            return
+
+
+# =========================================================
+# WebSocket Runner
+# =========================================================
 
 @app.websocket("/ws")
 async def websocket_endpoint(
@@ -136,9 +127,7 @@ async def websocket_endpoint(
 
     global runner_ws
 
-    token = websocket.query_params.get(
-        "token"
-    )
+    token = websocket.query_params.get("token")
 
     if token != TOKEN:
 
@@ -150,141 +139,32 @@ async def websocket_endpoint(
 
     await websocket.accept()
 
-    # =====================================
+    # =====================================================
     # Register Runner
-    # =====================================
+    # =====================================================
 
     async with runner_lock:
 
-        old_ws = runner_ws
+        old_runner = runner_ws
 
         runner_ws = websocket
 
-        if old_ws is not None:
+        if old_runner is not None:
 
             try:
-
-                await old_ws.close()
-
+                await old_runner.close()
             except Exception:
                 pass
 
-    print(
-        "Runner connected"
-    )
+    print("Runner connected")
 
-    # =====================================
-    # Sender
-    # =====================================
-
-    async def sender():
-
-        while True:
-
-            if not connections:
-
-                await asyncio.sleep(
-                    0.05
-                )
-
-                continue
-
-            tasks = []
-
-            task_map = {}
-
-            # ---------------------------------
-            # One queue reader per connection
-            # ---------------------------------
-
-            for (
-                connection_id,
-                conn
-            ) in list(
-                connections.items()
-            ):
-
-                if conn.closed:
-                    continue
-
-                task = asyncio.create_task(
-                    conn.to_runner.get()
-                )
-
-                tasks.append(task)
-
-                task_map[task] = (
-                    connection_id,
-                    conn
-                )
-
-            if not tasks:
-
-                await asyncio.sleep(
-                    0.05
-                )
-
-                continue
-
-            try:
-
-                done, pending = await asyncio.wait(
-                    tasks,
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-
-            except asyncio.CancelledError:
-
-                for task in tasks:
-
-                    task.cancel()
-
-                raise
-
-            # ---------------------------------
-            # Cancel remaining queue waits
-            # ---------------------------------
-
-            for task in pending:
-
-                task.cancel()
-
-            # ---------------------------------
-            # Send messages
-            # ---------------------------------
-
-            for task in done:
-
-                try:
-
-                    message = task.result()
-
-                except Exception:
-
-                    continue
-
-                try:
-
-                    await websocket.send_json(
-                        message
-                    )
-
-                except Exception as e:
-
-                    print(
-                        "WebSocket send error:",
-                        e
-                    )
-
-                    return
+    # =====================================================
+    # Start sender
+    # =====================================================
 
     sender_task = asyncio.create_task(
-        sender()
+        runner_sender(websocket)
     )
-
-    # =====================================
-    # Receive from Runner
-    # =====================================
 
     try:
 
@@ -292,31 +172,26 @@ async def websocket_endpoint(
 
             message = await websocket.receive_json()
 
-            msg_type = message.get(
-                "type"
-            )
+            msg_type = message.get("type")
 
             connection_id = message.get(
                 "connection_id"
             )
 
             if not connection_id:
-
                 continue
 
             conn = connections.get(
                 connection_id
             )
 
-            if not conn:
-
-                continue
-
-            # =================================
-            # DATA
-            # =================================
-
             if msg_type == "data":
+
+                if conn is None:
+                    continue
+
+                if conn.closed:
+                    continue
 
                 data = message.get(
                     "data",
@@ -325,66 +200,52 @@ async def websocket_endpoint(
 
                 if data:
 
-                    try:
-
-                        await conn.to_client.put({
-                            "type": "data",
-                            "data": data,
-                        })
-
-                    except Exception as e:
-
-                        print(
-                            f"[{connection_id}] "
-                            f"queue error:",
-                            e
-                        )
-
-            # =================================
-            # CLOSE
-            # =================================
+                    await conn.to_client.put({
+                        "type": "data",
+                        "data": data,
+                    })
 
             elif msg_type == "close":
 
+                if conn is None:
+                    continue
+
                 conn.closed = True
 
-                try:
-
-                    await conn.to_client.put({
-                        "type": "close"
-                    })
-
-                except Exception:
-                    pass
-
-            # =================================
-            # ERROR
-            # =================================
+                await conn.to_client.put({
+                    "type": "close"
+                })
 
             elif msg_type == "error":
 
+                if conn is None:
+                    continue
+
                 conn.closed = True
+
+                await conn.to_client.put({
+                    "type": "error",
+                    "message": message.get(
+                        "message",
+                        "Runner error"
+                    )
+                })
+
+            elif msg_type == "ping":
 
                 try:
 
-                    await conn.to_client.put({
-                        "type": "error",
-
-                        "message":
-                            message.get(
-                                "message",
-                                "Runner error"
-                            )
+                    await websocket.send_json({
+                        "type": "pong"
                     })
 
                 except Exception:
-                    pass
+
+                    break
 
     except WebSocketDisconnect:
 
-        print(
-            "Runner disconnected"
-        )
+        print("Runner disconnected")
 
     except Exception as e:
 
@@ -398,9 +259,7 @@ async def websocket_endpoint(
         sender_task.cancel()
 
         try:
-
             await sender_task
-
         except BaseException:
             pass
 
@@ -415,9 +274,27 @@ async def websocket_endpoint(
         )
 
 
-# =========================================
-# Open
-# =========================================
+# =========================================================
+# Queue message for Runner
+# =========================================================
+
+async def queue_to_runner(message):
+
+    if runner_ws is None:
+
+        raise HTTPException(
+            status_code=503,
+            detail="Runner is not connected"
+        )
+
+    await runner_queue.put(
+        message
+    )
+
+
+# =========================================================
+# OPEN
+# =========================================================
 
 @app.post("/open")
 async def open_connection(
@@ -437,16 +314,18 @@ async def open_connection(
 
     connection_id = req.connection_id
 
-    # -------------------------------------
-    # Duplicate
-    # -------------------------------------
+    # =====================================================
+    # Replace stale connection if necessary
+    # =====================================================
 
-    if connection_id in connections:
+    old = connections.pop(
+        connection_id,
+        None
+    )
 
-        raise HTTPException(
-            status_code=409,
-            detail="Connection already exists"
-        )
+    if old:
+
+        old.closed = True
 
     conn = Connection()
 
@@ -454,18 +333,11 @@ async def open_connection(
         connection_id
     ] = conn
 
-    await conn.to_runner.put({
-
+    await queue_to_runner({
         "type": "open",
-
-        "connection_id":
-            connection_id,
-
-        "host":
-            req.host,
-
-        "port":
-            req.port,
+        "connection_id": connection_id,
+        "host": req.host,
+        "port": req.port,
     })
 
     print(
@@ -476,15 +348,13 @@ async def open_connection(
 
     return {
         "ok": True,
-
-        "connection_id":
-            connection_id
+        "connection_id": connection_id
     }
 
 
-# =========================================
+# =========================================================
 # DATA
-# =========================================
+# =========================================================
 
 @app.post("/data")
 async def send_data(
@@ -499,7 +369,7 @@ async def send_data(
         req.connection_id
     )
 
-    if not conn:
+    if conn is None:
 
         raise HTTPException(
             status_code=404,
@@ -513,34 +383,27 @@ async def send_data(
             detail="Connection closed"
         )
 
-    try:
-
-        await conn.to_runner.put({
-
-            "type": "data",
-
-            "connection_id":
-                req.connection_id,
-
-            "data":
-                req.data,
-        })
-
-    except Exception as e:
+    if runner_ws is None:
 
         raise HTTPException(
             status_code=503,
-            detail=str(e)
+            detail="Runner is not connected"
         )
+
+    await queue_to_runner({
+        "type": "data",
+        "connection_id": req.connection_id,
+        "data": req.data,
+    })
 
     return {
         "ok": True
     }
 
 
-# =========================================
+# =========================================================
 # RECEIVE
-# =========================================
+# =========================================================
 
 @app.get(
     "/recv/{connection_id}"
@@ -558,7 +421,7 @@ async def receive_data(
         connection_id
     )
 
-    if not conn:
+    if conn is None:
 
         raise HTTPException(
             status_code=404,
@@ -579,34 +442,18 @@ async def receive_data(
     try:
 
         message = await asyncio.wait_for(
-
             conn.to_client.get(),
-
             timeout=RECV_TIMEOUT
         )
 
-        # =================================
-        # CLOSE
-        # =================================
-
-        if message.get(
+        msg_type = message.get(
             "type"
-        ) == "close":
+        )
 
-            conn.closed = True
-
-            connections.pop(
-                connection_id,
-                None
-            )
-
-        # =================================
-        # ERROR
-        # =================================
-
-        elif message.get(
-            "type"
-        ) == "error":
+        if msg_type in (
+            "close",
+            "error"
+        ):
 
             conn.closed = True
 
@@ -624,9 +471,9 @@ async def receive_data(
         }
 
 
-# =========================================
+# =========================================================
 # CLOSE
-# =========================================
+# =========================================================
 
 @app.post("/close")
 async def close_connection(
@@ -646,18 +493,18 @@ async def close_connection(
 
         conn.closed = True
 
-        try:
+        if runner_ws is not None:
 
-            await conn.to_runner.put({
+            try:
 
-                "type": "close",
+                await queue_to_runner({
+                    "type": "close",
+                    "connection_id":
+                        req.connection_id,
+                })
 
-                "connection_id":
-                    req.connection_id,
-            })
-
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         print(
             f"[CLOSE] "
