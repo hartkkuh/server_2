@@ -3,31 +3,57 @@ import threading
 import uuid
 import base64
 import requests
-import time
+import urllib3
 
+# =========================================
+# Configuration
+# =========================================
 
-RENDER_URL = "https://YOUR-RENDER-SERVICE.onrender.com"
-
-TOKEN = "CHANGE_ME"
+RENDER_URL = "https://server-2-vddr.onrender.com"
+TOKEN = "131232"
 
 LOCAL_HOST = "127.0.0.1"
 LOCAL_PORT = 3128
 
-
 BUFFER_SIZE = 16384
 
+# כרגע False בגלל תעודת NetFree.
+# לאחר הגדרת CA מתאים אפשר להפוך ל-True.
+VERIFY_SSL = False
+
+if not VERIFY_SSL:
+    urllib3.disable_warnings(
+        urllib3.exceptions.InsecureRequestWarning
+    )
+
+
+# =========================================
+# HTTP session
+# =========================================
 
 session = requests.Session()
 
+# חשוב מאוד:
+# requests לא ישתמש ב-HTTP_PROXY / HTTPS_PROXY
+# של Windows.
+#
+# אחרת הוא עלול לשלוח את החיבור ל-Render
+# בחזרה אל 127.0.0.1:3128 וליצור לולאה.
+session.trust_env = False
+
+
+# =========================================
+# Render API
+# =========================================
 
 def render_post(path, json_data):
-
     url = RENDER_URL + path
 
     response = session.post(
         url,
         json=json_data,
-        timeout=60
+        timeout=60,
+        verify=VERIFY_SSL
     )
 
     response.raise_for_status()
@@ -35,14 +61,14 @@ def render_post(path, json_data):
     return response.json()
 
 
-def render_get(path, params):
-
+def render_get(path, params=None):
     url = RENDER_URL + path
 
     response = session.get(
         url,
         params=params,
-        timeout=35
+        timeout=35,
+        verify=VERIFY_SSL
     )
 
     response.raise_for_status()
@@ -50,7 +76,14 @@ def render_get(path, params):
     return response.json()
 
 
+# =========================================
+# Send data to Render
+# =========================================
+
 def send_data(connection_id, data):
+
+    if not data:
+        return
 
     encoded = base64.b64encode(
         data
@@ -66,6 +99,10 @@ def send_data(connection_id, data):
     )
 
 
+# =========================================
+# Close remote connection
+# =========================================
+
 def close_remote(connection_id):
 
     try:
@@ -78,38 +115,63 @@ def close_remote(connection_id):
             }
         )
 
+    except requests.HTTPError as e:
+
+        # אם החיבור כבר נמחק בשרת - אין צורך
+        # להפיל את ה-client.
+        if e.response is not None and e.response.status_code == 404:
+            return
+
+        print(
+            f"[{connection_id}] close error:",
+            e
+        )
+
     except Exception as e:
 
         print(
-            "close error:",
+            f"[{connection_id}] close error:",
             e
         )
 
 
-def receive_loop(
-    client_socket,
-    connection_id
-):
+# =========================================
+# Receive data from Render
+# =========================================
+
+def receive_loop(client_socket, connection_id, stop_event):
 
     try:
 
-        while True:
+        while not stop_event.is_set():
 
-            result = render_get(
-                f"/recv/{connection_id}",
-                {
-                    "token": TOKEN
-                }
-            )
+            try:
 
-            msg_type = result.get(
-                "type"
-            )
+                result = render_get(
+                    f"/recv/{connection_id}",
+                    {
+                        "token": TOKEN
+                    }
+                )
 
+            except requests.HTTPError as e:
+
+                if (
+                    e.response is not None
+                    and e.response.status_code == 404
+                ):
+                    # Render כבר מחק את החיבור.
+                    break
+
+                raise
+
+            msg_type = result.get("type")
+
+            # אין כרגע מידע.
             if msg_type == "timeout":
-
                 continue
 
+            # נתונים מה-Runner.
             if msg_type == "data":
 
                 encoded = result.get(
@@ -117,24 +179,29 @@ def receive_loop(
                     ""
                 )
 
-                data = base64.b64decode(
-                    encoded
-                )
+                if encoded:
 
-                if data:
-
-                    client_socket.sendall(
-                        data
+                    data = base64.b64decode(
+                        encoded
                     )
 
+                    if data:
+
+                        client_socket.sendall(
+                            data
+                        )
+
+            # החיבור המרוחק נסגר.
             elif msg_type == "close":
 
                 break
 
+            # שגיאה מה-Runner.
             elif msg_type == "error":
 
                 print(
-                    "Remote error:",
+                    f"[{connection_id}] "
+                    f"Remote error:",
                     result.get("message")
                 )
 
@@ -142,12 +209,17 @@ def receive_loop(
 
     except Exception as e:
 
-        print(
-            f"[{connection_id}] receive error:",
-            e
-        )
+        if not stop_event.is_set():
+
+            print(
+                f"[{connection_id}] "
+                f"receive error:",
+                e
+            )
 
     finally:
+
+        stop_event.set()
 
         try:
             client_socket.shutdown(
@@ -162,6 +234,10 @@ def receive_loop(
             pass
 
 
+# =========================================
+# Parse browser request
+# =========================================
+
 def parse_target(client_socket):
 
     client_socket.settimeout(15)
@@ -175,7 +251,7 @@ def parse_target(client_socket):
         )
 
         if not chunk:
-            return None, None, None
+            return None, None, None, b"", b""
 
         data += chunk
 
@@ -202,21 +278,21 @@ def parse_target(client_socket):
     ).split("\r\n")
 
     if not lines:
-        return None, None, None
+        return None, None, None, b"", b""
 
     request_line = lines[0]
 
     parts = request_line.split()
 
     if len(parts) < 2:
-
-        return None, None, None
+        return None, None, None, b"", b""
 
     method = parts[0].upper()
-
     target = parts[1]
 
+    # =====================================
     # HTTPS CONNECT
+    # =====================================
 
     if method == "CONNECT":
 
@@ -237,12 +313,17 @@ def parse_target(client_socket):
         return (
             host,
             port,
-            True
+            True,
+            remaining,
+            method
         )
 
-    # Normal HTTP proxy request
+    # =====================================
+    # Normal HTTP
+    # =====================================
 
     host = None
+    port = 80
 
     for line in lines[1:]:
 
@@ -250,9 +331,7 @@ def parse_target(client_socket):
             "host:"
         ):
 
-            host = line[
-                5:
-            ].strip()
+            host = line[5:].strip()
 
             break
 
@@ -261,28 +340,32 @@ def parse_target(client_socket):
         return (
             None,
             None,
-            False
+            False,
+            remaining,
+            method
         )
 
     if ":" in host:
 
-        host, port = host.rsplit(
+        host, port_string = host.rsplit(
             ":",
             1
         )
 
-        port = int(port)
-
-    else:
-
-        port = 80
+        port = int(port_string)
 
     return (
         host,
         port,
-        False
+        False,
+        remaining,
+        method
     )
 
+
+# =========================================
+# Handle local browser connection
+# =========================================
 
 def handle_client(client_socket):
 
@@ -290,11 +373,19 @@ def handle_client(client_socket):
         uuid.uuid4()
     )
 
-    remote_socket = None
+    stop_event = threading.Event()
+
+    receiver = None
 
     try:
 
-        host, port, is_connect = parse_target(
+        (
+            host,
+            port,
+            is_connect,
+            remaining,
+            method
+        ) = parse_target(
             client_socket
         )
 
@@ -308,7 +399,9 @@ def handle_client(client_socket):
             f"{host}:{port}"
         )
 
-        # Open connection through Render
+        # =================================
+        # Open connection on Render
+        # =================================
 
         render_post(
             "/open",
@@ -320,7 +413,9 @@ def handle_client(client_socket):
             }
         )
 
-        # Tell browser that CONNECT succeeded
+        # =================================
+        # HTTPS CONNECT
+        # =================================
 
         if is_connect:
 
@@ -330,50 +425,70 @@ def handle_client(client_socket):
                 b"\r\n"
             )
 
+        # =================================
+        # Normal HTTP request
+        # =================================
+
         else:
 
-            # For normal HTTP requests,
-            # read the original header again
-            # and forward a minimal request.
+            # כאן אנחנו מעבירים את הבקשה המקורית
+            # כפי שהגיעה מהלקוח.
             #
-            # We need to reconstruct it because
-            # the browser normally sends an
-            # absolute URL when using a proxy.
-
-            # Re-read is impossible because
-            # parse_target consumed it.
+            # header כבר נקרא ב-parse_target(),
+            # לכן עבור HTTP רגיל צריך לשחזר
+            # את הבקשה.
             #
-            # Therefore regular HTTP proxy mode
-            # is intentionally handled by a second
-            # lightweight parser below.
+            # עבור HTTPS רוב התעבורה עוברת דרך CONNECT,
+            # ולכן זה הנתיב החשוב.
 
-            pass
+            request = (
+                f"{method} http://{host}/ HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode(
+                "iso-8859-1"
+            )
 
-        # Start HTTPS response polling
+            send_data(
+                connection_id,
+                request
+            )
+
+        # =================================
+        # Start receiver
+        # =================================
 
         receiver = threading.Thread(
             target=receive_loop,
             args=(
                 client_socket,
-                connection_id
+                connection_id,
+                stop_event
             ),
             daemon=True
         )
 
         receiver.start()
 
-        # Send remaining bytes if any
+        # =================================
+        # Send bytes already buffered
+        # =================================
 
-        # For CONNECT, remaining is normally empty.
-        #
-        # We need to retrieve any buffered data.
-        #
-        # Since parse_target currently doesn't expose
-        # remaining data, read normally.
+        if remaining:
+
+            send_data(
+                connection_id,
+                remaining
+            )
+
+        # =================================
+        # Browser -> Render
+        # =================================
 
         client_socket.settimeout(None)
 
-        while True:
+        while not stop_event.is_set():
 
             data = client_socket.recv(
                 BUFFER_SIZE
@@ -389,22 +504,42 @@ def handle_client(client_socket):
 
     except Exception as e:
 
-        print(
-            f"[{connection_id}] error:",
-            e
-        )
+        if not stop_event.is_set():
+
+            print(
+                f"[{connection_id}] "
+                f"error:",
+                e
+            )
 
     finally:
+
+        stop_event.set()
+
+        # =================================
+        # Tell Render to close
+        # =================================
 
         close_remote(
             connection_id
         )
 
         try:
+            client_socket.shutdown(
+                socket.SHUT_RDWR
+            )
+        except Exception:
+            pass
+
+        try:
             client_socket.close()
         except Exception:
             pass
 
+
+# =========================================
+# Start local proxy
+# =========================================
 
 def start_proxy():
 
@@ -438,32 +573,61 @@ def start_proxy():
     print(
         "================================="
     )
+
     print(
         f"Listening on "
         f"{LOCAL_HOST}:{LOCAL_PORT}"
     )
+
     print(
         f"Render: {RENDER_URL}"
     )
+
+    print(
+        f"SSL verification: "
+        f"{VERIFY_SSL}"
+    )
+
     print()
 
-    while True:
+    try:
 
-        client_socket, address = server.accept()
+        while True:
+
+            client_socket, address = (
+                server.accept()
+            )
+
+            print(
+                "Local client:",
+                address
+            )
+
+            thread = threading.Thread(
+                target=handle_client,
+                args=(client_socket,),
+                daemon=True
+            )
+
+            thread.start()
+
+    except KeyboardInterrupt:
 
         print(
-            "Local client:",
-            address
+            "\nStopping proxy..."
         )
 
-        thread = threading.Thread(
-            target=handle_client,
-            args=(client_socket,),
-            daemon=True
-        )
+    finally:
 
-        thread.start()
+        try:
+            server.close()
+        except Exception:
+            pass
 
+
+# =========================================
+# Main
+# =========================================
 
 if __name__ == "__main__":
 

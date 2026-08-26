@@ -1,38 +1,81 @@
 import os
 import asyncio
-import base64
-import uuid
 from typing import Dict
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    HTTPException
+)
+
 from pydantic import BaseModel
 
+
+# =========================================
+# FastAPI
+# =========================================
 
 app = FastAPI()
 
 
-TOKEN = os.environ.get("PROXY_TOKEN", "CHANGE_ME")
+# =========================================
+# Configuration
+# =========================================
 
+TOKEN = os.environ.get(
+    "PROXY_TOKEN",
+    "CHANGE_ME"
+)
+
+
+# =========================================
+# Connection object
+# =========================================
 
 class Connection:
+
     def __init__(self):
+
         self.to_runner = asyncio.Queue()
         self.to_client = asyncio.Queue()
+
         self.closed = False
 
+        self.lock = asyncio.Lock()
+
+
+# =========================================
+# Global state
+# =========================================
 
 connections: Dict[str, Connection] = {}
 
 runner_ws = None
+
 runner_lock = asyncio.Lock()
 
 
-def check_token(token: str):
-    if token != TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid token")
+# =========================================
+# Authentication
+# =========================================
 
+def check_token(token: str):
+
+    if token != TOKEN:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token"
+        )
+
+
+# =========================================
+# Request models
+# =========================================
 
 class OpenRequest(BaseModel):
+
     token: str
     connection_id: str
     host: str
@@ -40,18 +83,25 @@ class OpenRequest(BaseModel):
 
 
 class DataRequest(BaseModel):
+
     token: str
     connection_id: str
     data: str
 
 
 class CloseRequest(BaseModel):
+
     token: str
     connection_id: str
 
 
+# =========================================
+# Root
+# =========================================
+
 @app.get("/")
 async def root():
+
     return {
         "status": "online",
         "runner_connected": runner_ws is not None,
@@ -59,71 +109,146 @@ async def root():
     }
 
 
+# =========================================
+# WebSocket -> Runner
+# =========================================
+
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(
+    websocket: WebSocket
+):
 
     global runner_ws
 
-    token = websocket.query_params.get("token")
+    token = websocket.query_params.get(
+        "token"
+    )
 
     if token != TOKEN:
-        await websocket.close(code=1008)
+
+        await websocket.close(
+            code=1008
+        )
+
         return
 
     await websocket.accept()
 
+    # =====================================
+    # Register Runner
+    # =====================================
+
     async with runner_lock:
 
         if runner_ws is not None:
+
             try:
+
                 await runner_ws.close()
+
             except Exception:
                 pass
 
         runner_ws = websocket
 
-    print("Runner connected")
+    print(
+        "Runner connected"
+    )
+
+    # =====================================
+    # Sender task
+    # =====================================
 
     async def sender():
 
         while True:
 
-            # Wait for something that needs to be sent to runner
+            current_connections = list(
+                connections.items()
+            )
+
+            if not current_connections:
+
+                await asyncio.sleep(
+                    0.05
+                )
+
+                continue
+
             tasks = []
 
-            for connection_id, conn in list(connections.items()):
+            task_map = {}
 
-                tasks.append(
-                    asyncio.create_task(
-                        conn.to_runner.get()
-                    )
+            for connection_id, conn in current_connections:
+
+                if conn.closed:
+                    continue
+
+                task = asyncio.create_task(
+                    conn.to_runner.get()
+                )
+
+                tasks.append(task)
+
+                task_map[task] = (
+                    connection_id,
+                    conn
                 )
 
             if not tasks:
-                await asyncio.sleep(0.05)
+
+                await asyncio.sleep(
+                    0.05
+                )
+
                 continue
 
-            done, pending = await asyncio.wait(
-                tasks,
-                return_when=asyncio.FIRST_COMPLETED
-            )
+            try:
 
+                done, pending = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+            except asyncio.CancelledError:
+
+                for task in tasks:
+                    task.cancel()
+
+                raise
+
+            # Cancel tasks that did not win.
             for task in pending:
                 task.cancel()
 
+            # Send completed messages.
             for task in done:
 
                 try:
+
                     message = task.result()
+
                 except Exception:
+
                     continue
 
                 try:
-                    await websocket.send_json(message)
+
+                    await websocket.send_json(
+                        message
+                    )
+
                 except Exception:
+
                     return
 
-    sender_task = asyncio.create_task(sender())
+    sender_task = asyncio.create_task(
+        sender()
+    )
+
+    # =====================================
+    # Receive messages from Runner
+    # =====================================
 
     try:
 
@@ -131,67 +256,122 @@ async def websocket_endpoint(websocket: WebSocket):
 
             message = await websocket.receive_json()
 
-            msg_type = message.get("type")
-            connection_id = message.get("connection_id")
+            msg_type = message.get(
+                "type"
+            )
+
+            connection_id = message.get(
+                "connection_id"
+            )
 
             if not connection_id:
                 continue
 
-            conn = connections.get(connection_id)
+            conn = connections.get(
+                connection_id
+            )
 
             if not conn:
                 continue
 
+            # -----------------------------
+            # Runner -> client data
+            # -----------------------------
+
             if msg_type == "data":
 
-                data = message.get("data", "")
+                data = message.get(
+                    "data",
+                    ""
+                )
 
-                await conn.to_client.put({
-                    "type": "data",
-                    "data": data,
-                })
+                if data:
+
+                    await conn.to_client.put({
+                        "type": "data",
+                        "data": data,
+                    })
+
+            # -----------------------------
+            # Runner closed connection
+            # -----------------------------
 
             elif msg_type == "close":
+
+                conn.closed = True
 
                 await conn.to_client.put({
                     "type": "close"
                 })
 
-                conn.closed = True
+            # -----------------------------
+            # Runner error
+            # -----------------------------
 
             elif msg_type == "error":
 
-                await conn.to_client.put({
-                    "type": "error",
-                    "message": message.get("message", "Runner error")
-                })
-
                 conn.closed = True
 
+                await conn.to_client.put({
+                    "type": "error",
+                    "message": message.get(
+                        "message",
+                        "Runner error"
+                    )
+                })
+
     except WebSocketDisconnect:
-        print("Runner disconnected")
+
+        print(
+            "Runner disconnected"
+        )
 
     except Exception as e:
-        print("WebSocket error:", e)
+
+        print(
+            "WebSocket error:",
+            e
+        )
 
     finally:
 
         sender_task.cancel()
 
+        try:
+            await sender_task
+        except BaseException:
+            pass
+
+        # =================================
+        # Remove Runner
+        # =================================
+
         async with runner_lock:
 
             if runner_ws is websocket:
+
                 runner_ws = None
 
-        print("Runner connection closed")
+        print(
+            "Runner connection closed"
+        )
 
+
+# =========================================
+# Open connection
+# =========================================
 
 @app.post("/open")
-async def open_connection(req: OpenRequest):
+async def open_connection(
+    req: OpenRequest
+):
 
-    check_token(req.token)
+    check_token(
+        req.token
+    )
 
     if runner_ws is None:
+
         raise HTTPException(
             status_code=503,
             detail="Runner is not connected"
@@ -200,6 +380,7 @@ async def open_connection(req: OpenRequest):
     connection_id = req.connection_id
 
     if connection_id in connections:
+
         raise HTTPException(
             status_code=409,
             detail="Connection already exists"
@@ -207,84 +388,184 @@ async def open_connection(req: OpenRequest):
 
     conn = Connection()
 
-    connections[connection_id] = conn
+    connections[
+        connection_id
+    ] = conn
 
     await conn.to_runner.put({
+
         "type": "open",
-        "connection_id": connection_id,
-        "host": req.host,
-        "port": req.port,
+
+        "connection_id":
+            connection_id,
+
+        "host":
+            req.host,
+
+        "port":
+            req.port,
     })
 
+    print(
+        f"[OPEN] "
+        f"{connection_id} -> "
+        f"{req.host}:{req.port}"
+    )
+
     return {
+
         "ok": True,
-        "connection_id": connection_id,
+
+        "connection_id":
+            connection_id,
     }
 
 
+# =========================================
+# Send data
+# =========================================
+
 @app.post("/data")
-async def send_data(req: DataRequest):
+async def send_data(
+    req: DataRequest
+):
 
-    check_token(req.token)
+    check_token(
+        req.token
+    )
 
-    conn = connections.get(req.connection_id)
+    conn = connections.get(
+        req.connection_id
+    )
 
     if not conn:
+
         raise HTTPException(
             status_code=404,
             detail="Connection not found"
         )
 
+    if conn.closed:
+
+        raise HTTPException(
+            status_code=410,
+            detail="Connection closed"
+        )
+
     await conn.to_runner.put({
+
         "type": "data",
-        "connection_id": req.connection_id,
-        "data": req.data,
+
+        "connection_id":
+            req.connection_id,
+
+        "data":
+            req.data,
     })
 
-    return {"ok": True}
+    return {
+        "ok": True
+    }
 
 
-@app.get("/recv/{connection_id}")
+# =========================================
+# Receive data
+# =========================================
+
+@app.get(
+    "/recv/{connection_id}"
+)
 async def receive_data(
     connection_id: str,
     token: str
 ):
 
-    check_token(token)
+    check_token(
+        token
+    )
 
-    conn = connections.get(connection_id)
+    conn = connections.get(
+        connection_id
+    )
 
     if not conn:
+
         raise HTTPException(
             status_code=404,
             detail="Connection not found"
         )
 
-    try:
+    # =====================================
+    # If already closed
+    # =====================================
 
-        # Long polling.
-        # Wait up to 25 seconds for data.
+    if conn.closed:
+
+        # Remove it only if it is still
+        # the same object.
+        connections.pop(
+            connection_id,
+            None
+        )
+
+        return {
+            "type": "close"
+        }
+
+    try:
 
         message = await asyncio.wait_for(
             conn.to_client.get(),
             timeout=25
         )
 
+        # If close arrived, clean up.
+        if message.get("type") == "close":
+
+            conn.closed = True
+
+            connections.pop(
+                connection_id,
+                None
+            )
+
+        elif message.get("type") == "error":
+
+            conn.closed = True
+
+            connections.pop(
+                connection_id,
+                None
+            )
+
         return message
 
     except asyncio.TimeoutError:
 
+        # Don't delete the connection.
+        # It is still alive.
         return {
             "type": "timeout"
         }
 
 
+# =========================================
+# Close connection
+# =========================================
+
 @app.post("/close")
-async def close_connection(req: CloseRequest):
+async def close_connection(
+    req: CloseRequest
+):
 
-    check_token(req.token)
+    check_token(
+        req.token
+    )
 
-    conn = connections.pop(req.connection_id, None)
+    conn = connections.pop(
+        req.connection_id,
+        None
+    )
 
     if conn:
 
@@ -295,13 +576,24 @@ async def close_connection(req: CloseRequest):
             try:
 
                 await conn.to_runner.put({
+
                     "type": "close",
-                    "connection_id": req.connection_id,
+
+                    "connection_id":
+                        req.connection_id,
                 })
 
             except Exception:
+
                 pass
 
+        print(
+            f"[CLOSE] "
+            f"{req.connection_id}"
+        )
+
+    # Idempotent close:
+    # גם אם החיבור כבר נסגר, לא מחזירים 404.
     return {
         "ok": True
     }
