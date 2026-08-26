@@ -1,191 +1,269 @@
-import asyncio
-import json
 import os
+import asyncio
+import base64
+import json
 
 import websockets
 
 
-RELAY_URL = os.environ["RELAY_URL"]
-TOKEN = os.environ["RELAY_TOKEN"]
-
-SQUID_HOST = "127.0.0.1"
-SQUID_PORT = 3128
+RENDER_WS = os.environ["RENDER_WS"]
+TOKEN = os.environ["PROXY_TOKEN"]
 
 
-async def bridge_connection(client_id):
+connections = {}
 
-    bridge_url = (
-        RELAY_URL
-        .replace(
-            "/ws/control",
-            f"/ws/bridge/{client_id}",
-        )
-    )
 
-    print(
-        f"Opening bridge: {client_id}",
-        flush=True,
-    )
+async def send_data(ws, connection_id, data):
+
+    encoded = base64.b64encode(data).decode("ascii")
+
+    await ws.send(json.dumps({
+        "type": "data",
+        "connection_id": connection_id,
+        "data": encoded,
+    }))
+
+
+async def close_connection(ws, connection_id):
 
     try:
 
-        async with websockets.connect(
-            bridge_url,
-            ping_interval=20,
-            ping_timeout=20,
-            max_size=None,
-        ) as ws:
+        await ws.send(json.dumps({
+            "type": "close",
+            "connection_id": connection_id,
+        }))
 
-            await ws.send(
-                json.dumps({
-                    "type": "auth",
-                    "role": "bridge",
-                    "token": TOKEN,
-                })
+    except Exception:
+        pass
+
+
+async def pipe_reader(ws, connection_id, reader):
+
+    try:
+
+        while True:
+
+            data = await reader.read(16384)
+
+            if not data:
+                break
+
+            await send_data(
+                ws,
+                connection_id,
+                data
             )
-
-            reader, writer = await asyncio.open_connection(
-                SQUID_HOST,
-                SQUID_PORT,
-            )
-
-            async def websocket_to_squid():
-
-                try:
-
-                    async for message in ws:
-
-                        if isinstance(message, bytes):
-
-                            writer.write(message)
-
-                            await writer.drain()
-
-                except Exception as e:
-
-                    print(
-                        "WS -> Squid error:",
-                        repr(e),
-                        flush=True,
-                    )
-
-
-            async def squid_to_websocket():
-
-                try:
-
-                    while True:
-
-                        data = await reader.read(
-                            65536
-                        )
-
-                        if not data:
-                            break
-
-                        await ws.send(data)
-
-                except Exception as e:
-
-                    print(
-                        "Squid -> WS error:",
-                        repr(e),
-                        flush=True,
-                    )
-
-
-            await asyncio.gather(
-                websocket_to_squid(),
-                squid_to_websocket(),
-            )
-
-            writer.close()
-
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
 
     except Exception as e:
 
         print(
-            f"Bridge {client_id} error:",
-            repr(e),
-            flush=True,
+            f"[{connection_id}] reader error:",
+            e
+        )
+
+    finally:
+
+        await close_connection(
+            ws,
+            connection_id
         )
 
 
-async def runner():
+async def handle_open(ws, message):
+
+    connection_id = message["connection_id"]
+
+    host = message["host"]
+
+    port = int(message["port"])
+
+    print(
+        f"[OPEN] {connection_id} -> "
+        f"{host}:{port}"
+    )
+
+    try:
+
+        reader, writer = await asyncio.open_connection(
+            host,
+            port
+        )
+
+        connections[connection_id] = (
+            reader,
+            writer
+        )
+
+        asyncio.create_task(
+            pipe_reader(
+                ws,
+                connection_id,
+                reader
+            )
+        )
+
+    except Exception as e:
+
+        print(
+            f"[OPEN ERROR] {connection_id}:",
+            e
+        )
+
+        await ws.send(json.dumps({
+            "type": "error",
+            "connection_id": connection_id,
+            "message": str(e),
+        }))
+
+
+async def handle_data(message):
+
+    connection_id = message["connection_id"]
+
+    encoded = message.get("data", "")
+
+    if connection_id not in connections:
+        return
+
+    reader, writer = connections[connection_id]
+
+    try:
+
+        data = base64.b64decode(encoded)
+
+        writer.write(data)
+
+        await writer.drain()
+
+    except Exception as e:
+
+        print(
+            f"[WRITE ERROR] {connection_id}:",
+            e
+        )
+
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def handle_close(message):
+
+    connection_id = message["connection_id"]
+
+    connection = connections.pop(
+        connection_id,
+        None
+    )
+
+    if not connection:
+        return
+
+    reader, writer = connection
+
+    try:
+
+        writer.close()
+
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    print(
+        f"[CLOSE] {connection_id}"
+    )
+
+
+async def run():
+
+    url = (
+        RENDER_WS
+        + "?token="
+        + TOKEN
+    )
 
     while True:
 
         try:
 
             print(
-                f"Connecting to {RELAY_URL}",
-                flush=True,
+                "Connecting to Render..."
             )
 
             async with websockets.connect(
-                RELAY_URL,
+                url,
                 ping_interval=20,
                 ping_timeout=20,
-                max_size=None,
+                max_size=None
             ) as ws:
 
                 print(
-                    "Connected to Render",
-                    flush=True,
+                    "Connected to Render"
                 )
 
-                await ws.send(
-                    json.dumps({
-                        "type": "auth",
-                        "role": "runner",
-                        "token": TOKEN,
-                    })
-                )
+                async for raw_message in ws:
 
-                print(
-                    "Runner authenticated",
-                    flush=True,
-                )
+                    message = json.loads(
+                        raw_message
+                    )
 
-                async for message in ws:
+                    msg_type = message.get(
+                        "type"
+                    )
 
-                    if not isinstance(
-                        message,
-                        str,
-                    ):
-                        continue
-
-                    data = json.loads(message)
-
-                    if data.get("type") == "connect":
-
-                        client_id = data["id"]
+                    if msg_type == "open":
 
                         asyncio.create_task(
-                            bridge_connection(
-                                client_id
+                            handle_open(
+                                ws,
+                                message
                             )
+                        )
+
+                    elif msg_type == "data":
+
+                        await handle_data(
+                            message
+                        )
+
+                    elif msg_type == "close":
+
+                        await handle_close(
+                            message
                         )
 
         except Exception as e:
 
             print(
-                "Runner connection error:",
-                repr(e),
-                flush=True,
+                "Render connection error:",
+                e
             )
 
+        # Clean up connections
+
+        for connection_id, (
+            reader,
+            writer
+        ) in list(connections.items()):
+
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+        connections.clear()
+
         print(
-            "Reconnecting in 5 seconds...",
-            flush=True,
+            "Reconnecting in 5 seconds..."
         )
 
         await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
-    asyncio.run(runner())
+    asyncio.run(run())

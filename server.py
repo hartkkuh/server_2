@@ -1,332 +1,307 @@
-import asyncio
-import json
 import os
+import asyncio
+import base64
 import uuid
+from typing import Dict
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from pydantic import BaseModel
+
 
 app = FastAPI()
 
-TOKEN = os.environ["RELAY_TOKEN"]
 
-runner_control = None
+TOKEN = os.environ.get("PROXY_TOKEN", "CHANGE_ME")
 
-pending_clients = {}
-active_bridges = {}
 
-lock = asyncio.Lock()
+class Connection:
+    def __init__(self):
+        self.to_runner = asyncio.Queue()
+        self.to_client = asyncio.Queue()
+        self.closed = False
+
+
+connections: Dict[str, Connection] = {}
+
+runner_ws = None
+runner_lock = asyncio.Lock()
+
+
+def check_token(token: str):
+    if token != TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+class OpenRequest(BaseModel):
+    token: str
+    connection_id: str
+    host: str
+    port: int
+
+
+class DataRequest(BaseModel):
+    token: str
+    connection_id: str
+    data: str
+
+
+class CloseRequest(BaseModel):
+    token: str
+    connection_id: str
 
 
 @app.get("/")
 async def root():
     return {
         "status": "online",
-        "service": "proxy relay",
+        "runner_connected": runner_ws is not None,
+        "connections": len(connections),
     }
 
 
-async def auth(ws, expected_role):
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
 
-    try:
+    global runner_ws
 
-        msg = await asyncio.wait_for(
-            ws.receive_text(),
-            timeout=15,
-        )
+    token = websocket.query_params.get("token")
 
-        data = json.loads(msg)
-
-        if data.get("type") != "auth":
-            return False
-
-        if data.get("token") != TOKEN:
-            return False
-
-        if data.get("role") != expected_role:
-            return False
-
-        return True
-
-    except Exception:
-        return False
-
-
-async def relay(a, b):
-
-    async def a_to_b():
-
-        try:
-
-            while True:
-
-                msg = await a.receive()
-
-                if msg.get("bytes") is not None:
-                    await b.send_bytes(msg["bytes"])
-
-                elif msg.get("text") is not None:
-                    await b.send_text(msg["text"])
-
-                elif msg.get("type") == "websocket.disconnect":
-                    break
-
-        except Exception:
-            pass
-
-
-    async def b_to_a():
-
-        try:
-
-            while True:
-
-                msg = await b.receive()
-
-                if msg.get("bytes") is not None:
-                    await a.send_bytes(msg["bytes"])
-
-                elif msg.get("text") is not None:
-                    await a.send_text(msg["text"])
-
-                elif msg.get("type") == "websocket.disconnect":
-                    break
-
-        except Exception:
-            pass
-
-
-    await asyncio.gather(
-        a_to_b(),
-        b_to_a(),
-    )
-
-
-@app.websocket("/ws/control")
-async def control(ws: WebSocket):
-
-    global runner_control
-
-    await ws.accept()
-
-    if not await auth(ws, "runner"):
-        await ws.close(code=1008)
+    if token != TOKEN:
+        await websocket.close(code=1008)
         return
 
-    async with lock:
-        runner_control = ws
+    await websocket.accept()
 
-    print("Runner connected", flush=True)
+    async with runner_lock:
+
+        if runner_ws is not None:
+            try:
+                await runner_ws.close()
+            except Exception:
+                pass
+
+        runner_ws = websocket
+
+    print("Runner connected")
+
+    async def sender():
+
+        while True:
+
+            # Wait for something that needs to be sent to runner
+            tasks = []
+
+            for connection_id, conn in list(connections.items()):
+
+                tasks.append(
+                    asyncio.create_task(
+                        conn.to_runner.get()
+                    )
+                )
+
+            if not tasks:
+                await asyncio.sleep(0.05)
+                continue
+
+            done, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            for task in pending:
+                task.cancel()
+
+            for task in done:
+
+                try:
+                    message = task.result()
+                except Exception:
+                    continue
+
+                try:
+                    await websocket.send_json(message)
+                except Exception:
+                    return
+
+    sender_task = asyncio.create_task(sender())
 
     try:
 
         while True:
 
-            msg = await ws.receive()
+            message = await websocket.receive_json()
 
-            if msg.get("type") == "websocket.disconnect":
-                break
+            msg_type = message.get("type")
+            connection_id = message.get("connection_id")
 
-    except Exception as e:
+            if not connection_id:
+                continue
 
-        print(
-            "Control error:",
-            repr(e),
-            flush=True,
-        )
+            conn = connections.get(connection_id)
 
-    finally:
+            if not conn:
+                continue
 
-        async with lock:
+            if msg_type == "data":
 
-            if runner_control is ws:
-                runner_control = None
+                data = message.get("data", "")
 
-        print(
-            "Runner disconnected",
-            flush=True,
-        )
-
-
-@app.websocket("/ws/client")
-async def client(ws: WebSocket):
-
-    await ws.accept()
-
-    if not await auth(ws, "client"):
-        await ws.close(code=1008)
-        return
-
-    async with lock:
-        runner = runner_control
-
-    if runner is None:
-
-        await ws.send_text(
-            json.dumps({
-                "type": "error",
-                "message": "No runner connected",
-            })
-        )
-
-        await ws.close(code=1013)
-        return
-
-    client_id = uuid.uuid4().hex
-
-    async with lock:
-        pending_clients[client_id] = ws
-
-    print(
-        "Client:",
-        client_id,
-        flush=True,
-    )
-
-    try:
-
-        await runner.send_text(
-            json.dumps({
-                "type": "connect",
-                "id": client_id,
-            })
-        )
-
-        # Wait for runner bridge.
-        for _ in range(300):
-
-            async with lock:
-
-                bridge = active_bridges.get(
-                    client_id
-                )
-
-            if bridge is not None:
-                break
-
-            await asyncio.sleep(0.1)
-
-        else:
-
-            await ws.send_text(
-                json.dumps({
-                    "type": "error",
-                    "message": "Runner bridge timeout",
+                await conn.to_client.put({
+                    "type": "data",
+                    "data": data,
                 })
-            )
 
-            return
+            elif msg_type == "close":
 
-        await ws.send_text(
-            json.dumps({
-                "type": "connected",
-            })
-        )
+                await conn.to_client.put({
+                    "type": "close"
+                })
 
-        async with lock:
-            pending_clients.pop(
-                client_id,
-                None,
-            )
+                conn.closed = True
+
+            elif msg_type == "error":
+
+                await conn.to_client.put({
+                    "type": "error",
+                    "message": message.get("message", "Runner error")
+                })
+
+                conn.closed = True
+
+    except WebSocketDisconnect:
+        print("Runner disconnected")
 
     except Exception as e:
-
-        print(
-            "Client error:",
-            repr(e),
-            flush=True,
-        )
+        print("WebSocket error:", e)
 
     finally:
 
-        async with lock:
+        sender_task.cancel()
 
-            pending_clients.pop(
-                client_id,
-                None,
-            )
+        async with runner_lock:
 
-            active_bridges.pop(
-                client_id,
-                None,
-            )
+            if runner_ws is websocket:
+                runner_ws = None
 
-        try:
-            await ws.close()
-        except Exception:
-            pass
+        print("Runner connection closed")
 
 
-@app.websocket("/ws/bridge/{client_id}")
-async def bridge(
-    ws: WebSocket,
-    client_id: str,
+@app.post("/open")
+async def open_connection(req: OpenRequest):
+
+    check_token(req.token)
+
+    if runner_ws is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Runner is not connected"
+        )
+
+    connection_id = req.connection_id
+
+    if connection_id in connections:
+        raise HTTPException(
+            status_code=409,
+            detail="Connection already exists"
+        )
+
+    conn = Connection()
+
+    connections[connection_id] = conn
+
+    await conn.to_runner.put({
+        "type": "open",
+        "connection_id": connection_id,
+        "host": req.host,
+        "port": req.port,
+    })
+
+    return {
+        "ok": True,
+        "connection_id": connection_id,
+    }
+
+
+@app.post("/data")
+async def send_data(req: DataRequest):
+
+    check_token(req.token)
+
+    conn = connections.get(req.connection_id)
+
+    if not conn:
+        raise HTTPException(
+            status_code=404,
+            detail="Connection not found"
+        )
+
+    await conn.to_runner.put({
+        "type": "data",
+        "connection_id": req.connection_id,
+        "data": req.data,
+    })
+
+    return {"ok": True}
+
+
+@app.get("/recv/{connection_id}")
+async def receive_data(
+    connection_id: str,
+    token: str
 ):
 
-    await ws.accept()
+    check_token(token)
 
-    if not await auth(ws, "bridge"):
-        await ws.close(code=1008)
-        return
+    conn = connections.get(connection_id)
 
-    async with lock:
-
-        client = pending_clients.get(
-            client_id
+    if not conn:
+        raise HTTPException(
+            status_code=404,
+            detail="Connection not found"
         )
-
-        if client is None:
-            await ws.close(code=1008)
-            return
-
-        active_bridges[client_id] = ws
-
-    print(
-        "Bridge connected:",
-        client_id,
-        flush=True,
-    )
 
     try:
 
-        await client.send_text(
-            json.dumps({
-                "type": "connected",
-            })
+        # Long polling.
+        # Wait up to 25 seconds for data.
+
+        message = await asyncio.wait_for(
+            conn.to_client.get(),
+            timeout=25
         )
 
-        await relay(
-            client,
-            ws,
-        )
+        return message
 
-    except Exception as e:
+    except asyncio.TimeoutError:
 
-        print(
-            "Bridge error:",
-            repr(e),
-            flush=True,
-        )
+        return {
+            "type": "timeout"
+        }
 
-    finally:
 
-        async with lock:
+@app.post("/close")
+async def close_connection(req: CloseRequest):
 
-            pending_clients.pop(
-                client_id,
-                None,
-            )
+    check_token(req.token)
 
-            active_bridges.pop(
-                client_id,
-                None,
-            )
+    conn = connections.pop(req.connection_id, None)
 
-        try:
-            await client.close()
-        except Exception:
-            pass
+    if conn:
 
-        try:
-            await ws.close()
-        except Exception:
-            pass
+        conn.closed = True
+
+        if runner_ws is not None:
+
+            try:
+
+                await conn.to_runner.put({
+                    "type": "close",
+                    "connection_id": req.connection_id,
+                })
+
+            except Exception:
+                pass
+
+    return {
+        "ok": True
+    }
