@@ -2,57 +2,72 @@ import os
 import asyncio
 import base64
 import json
+import socket
+from typing import Dict
 
-import websockets
 
-
-# =========================================================
+# ============================================================
 # Configuration
-# =========================================================
+# ============================================================
 
-RENDER_WS = os.environ["RENDER_WS"]
+RENDER_WS = os.environ[
+    "RENDER_WS"
+]
 
-TOKEN = os.environ["PROXY_TOKEN"]
+TOKEN = os.environ[
+    "PROXY_TOKEN"
+]
 
-BUFFER_SIZE = 16384
+BUFFER_SIZE = 65536
 
-OPEN_TIMEOUT = 60
+CONNECT_TIMEOUT = 20
 
-PING_INTERVAL = 20
+RECONNECT_DELAYS = (
+    2,
+    4,
+    8,
+    15,
+    30
+)
 
-PING_TIMEOUT = 30
 
-RECONNECT_DELAY = 5
-
-
-# =========================================================
+# ============================================================
 # Active connections
-# =========================================================
+# ============================================================
 
-connections = {}
+connections: Dict[
+    str,
+    tuple
+] = {}
 
 connections_lock = asyncio.Lock()
 
+opening_connections = {}
 
-# =========================================================
-# Send JSON
-# =========================================================
 
-async def send_json(
+# ============================================================
+# Send message
+# ============================================================
+
+async def send_message(
     ws,
     message
 ):
 
     await ws.send(
         json.dumps(
-            message
+            message,
+            separators=(
+                ",",
+                ":"
+            )
         )
     )
 
 
-# =========================================================
-# Send TCP data
-# =========================================================
+# ============================================================
+# Send TCP data to Render
+# ============================================================
 
 async def send_data(
     ws,
@@ -65,22 +80,25 @@ async def send_data(
 
     encoded = base64.b64encode(
         data
-    ).decode("ascii")
+    ).decode(
+        "ascii"
+    )
 
-    await send_json(
+    await send_message(
         ws,
         {
             "type": "data",
             "connection_id":
                 connection_id,
-            "data": encoded,
+            "data":
+                encoded,
         }
     )
 
 
-# =========================================================
-# Notify Render about close
-# =========================================================
+# ============================================================
+# Notify Render CLOSE
+# ============================================================
 
 async def notify_close(
     ws,
@@ -89,7 +107,7 @@ async def notify_close(
 
     try:
 
-        await send_json(
+        await send_message(
             ws,
             {
                 "type": "close",
@@ -102,9 +120,9 @@ async def notify_close(
         pass
 
 
-# =========================================================
-# Read remote TCP socket
-# =========================================================
+# ============================================================
+# Reader
+# ============================================================
 
 async def pipe_reader(
     ws,
@@ -122,6 +140,7 @@ async def pipe_reader(
             )
 
             if not data:
+
                 break
 
             await send_data(
@@ -138,32 +157,34 @@ async def pipe_reader(
 
         print(
             f"[{connection_id}] "
-            f"reader error: {e}"
+            f"reader error:",
+            e
         )
 
     finally:
 
-        async with connections_lock:
+        current = connections.get(
+            connection_id
+        )
 
-            current = connections.get(
-                connection_id
+        if (
+            current is not None
+            and current[1] is writer
+        ):
+
+            connections.pop(
+                connection_id,
+                None
             )
-
-            if (
-                current is not None
-                and current[1] is writer
-            ):
-
-                connections.pop(
-                    connection_id,
-                    None
-                )
 
         try:
 
             writer.close()
 
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
         except Exception:
             pass
@@ -174,9 +195,9 @@ async def pipe_reader(
         )
 
 
-# =========================================================
+# ============================================================
 # OPEN
-# =========================================================
+# ============================================================
 
 async def handle_open(
     ws,
@@ -192,7 +213,9 @@ async def handle_open(
     ]
 
     port = int(
-        message["port"]
+        message[
+            "port"
+        ]
     )
 
     print(
@@ -201,20 +224,23 @@ async def handle_open(
         f"{host}:{port}"
     )
 
-    reader = None
-    writer = None
-
     try:
 
-        reader, writer = (
-            await asyncio.wait_for(
-                asyncio.open_connection(
-                    host,
-                    port
-                ),
-                timeout=30
-            )
+        # ====================================================
+        # Connect with timeout
+        # ====================================================
+
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                host,
+                port
+            ),
+            timeout=CONNECT_TIMEOUT
         )
+
+        # ====================================================
+        # Store
+        # ====================================================
 
         async with connections_lock:
 
@@ -246,6 +272,24 @@ async def handle_open(
             f"{host}:{port}"
         )
 
+        # ====================================================
+        # Tell Render OPEN succeeded
+        # ====================================================
+
+        await send_message(
+            ws,
+            {
+                "type":
+                    "open_ok",
+                "connection_id":
+                    connection_id,
+            }
+        )
+
+        # ====================================================
+        # Start reader
+        # ====================================================
+
         asyncio.create_task(
             pipe_reader(
                 ws,
@@ -259,51 +303,57 @@ async def handle_open(
 
         print(
             f"[OPEN ERROR] "
-            f"{connection_id}: {e}"
+            f"{connection_id}:",
+            e
         )
 
-        if writer:
+        await send_message(
+            ws,
+            {
+                "type":
+                    "error",
+                "connection_id":
+                    connection_id,
+                "message":
+                    str(e),
+            }
+        )
 
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+
+# ============================================================
+# DATA
+# ============================================================
+
+async def handle_data(
+    connection_id,
+    encoded
+):
+
+    # ========================================================
+    # Wait for OPEN
+    # ========================================================
+
+    task = opening_connections.get(
+        connection_id
+    )
+
+    if task is not None:
 
         try:
 
-            await send_json(
-                ws,
-                {
-                    "type": "error",
-                    "connection_id":
-                        connection_id,
-                    "message":
-                        str(e),
-                }
-            )
+            await task
 
         except Exception:
             pass
 
-
-# =========================================================
-# DATA
-# =========================================================
-
-async def handle_data(
-    ws,
-    message
-):
-
-    connection_id = message[
-        "connection_id"
-    ]
-
-    encoded = message.get(
-        "data",
-        ""
+    connection = connections.get(
+        connection_id
     )
+
+    if not connection:
+        return
+
+    reader, writer = connection
 
     if not encoded:
         return
@@ -314,58 +364,8 @@ async def handle_data(
             encoded
         )
 
-    except Exception as e:
-
-        print(
-            f"[{connection_id}] "
-            f"Base64 error: {e}"
-        )
-
-        return
-
-    async with connections_lock:
-
-        connection = connections.get(
-            connection_id
-        )
-
-    if not connection:
-
-        # =================================================
-        # DATA יכול להגיע מעט לפני OPEN.
-        #
-        # במקום לזרוק אותו, נחכה שה-OPEN ייצור
-        # את החיבור.
-        # =================================================
-
-        for _ in range(100):
-
-            await asyncio.sleep(
-                0.05
-            )
-
-            async with connections_lock:
-
-                connection = connections.get(
-                    connection_id
-                )
-
-            if connection:
-
-                break
-
-        if not connection:
-
-            print(
-                f"[{connection_id}] "
-                f"DATA arrived before connection"
-            )
-
+        if not data:
             return
-
-    reader, writer = connection
-
-    try:
 
         writer.write(
             data
@@ -376,55 +376,61 @@ async def handle_data(
     except Exception as e:
 
         print(
-            f"[{connection_id}] "
-            f"write error: {e}"
+            f"[WRITE ERROR] "
+            f"{connection_id}:",
+            e
         )
 
-        async with connections_lock:
+        current = connections.get(
+            connection_id
+        )
 
-            current = connections.get(
-                connection_id
+        if (
+            current is not None
+            and current[1] is writer
+        ):
+
+            connections.pop(
+                connection_id,
+                None
             )
-
-            if (
-                current is not None
-                and current[1] is writer
-            ):
-
-                connections.pop(
-                    connection_id,
-                    None
-                )
 
         try:
 
             writer.close()
 
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
         except Exception:
             pass
 
 
-# =========================================================
+# ============================================================
 # CLOSE
-# =========================================================
+# ============================================================
 
 async def handle_close(
-    ws,
-    message
+    connection_id
 ):
 
-    connection_id = message[
-        "connection_id"
-    ]
+    task = opening_connections.get(
+        connection_id
+    )
 
-    async with connections_lock:
+    if task is not None:
 
-        connection = connections.pop(
-            connection_id,
-            None
-        )
+        try:
+            await task
+        except Exception:
+            pass
+
+    connection = connections.pop(
+        connection_id,
+        None
+    )
 
     if not connection:
         return
@@ -435,7 +441,10 @@ async def handle_close(
 
         writer.close()
 
-        await writer.wait_closed()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
     except Exception:
         pass
@@ -446,40 +455,53 @@ async def handle_close(
     )
 
 
-# =========================================================
+# ============================================================
 # Cleanup
-# =========================================================
+# ============================================================
 
 async def cleanup_connections():
 
-    async with connections_lock:
-
-        current = list(
-            connections.items()
-        )
-
-        connections.clear()
-
-    for connection_id, (
-        reader,
-        writer
-    ) in current:
+    for (
+        connection_id,
+        connection
+    ) in list(
+        connections.items()
+    ):
 
         try:
 
+            reader, writer = connection
+
             writer.close()
 
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
         except Exception:
             pass
 
+    connections.clear()
 
-# =========================================================
-# Main
-# =========================================================
+    for task in list(
+        opening_connections.values()
+    ):
 
-async def run():
+        if not task.done():
+
+            task.cancel()
+
+    opening_connections.clear()
+
+
+# ============================================================
+# Run one WebSocket session
+# ============================================================
+
+async def run_session():
+
+    import websockets
 
     url = (
         RENDER_WS
@@ -487,124 +509,151 @@ async def run():
         + TOKEN
     )
 
-    reconnect_delay = RECONNECT_DELAY
+    print(
+        "Connecting to Render..."
+    )
+
+    async with websockets.connect(
+        url,
+        ping_interval=20,
+        ping_timeout=20,
+        close_timeout=10,
+        max_size=None,
+        max_queue=1024
+    ) as ws:
+
+        print(
+            "Connected to Render"
+        )
+
+        async for raw_message in ws:
+
+            try:
+
+                message = json.loads(
+                    raw_message
+                )
+
+            except Exception as e:
+
+                print(
+                    "Invalid JSON:",
+                    e
+                )
+
+                continue
+
+            msg_type = message.get(
+                "type"
+            )
+
+            connection_id = message.get(
+                "connection_id"
+            )
+
+            if not connection_id:
+                continue
+
+            # =================================================
+            # OPEN
+            # =================================================
+
+            if msg_type == "open":
+
+                old_task = opening_connections.get(
+                    connection_id
+                )
+
+                if old_task:
+
+                    if not old_task.done():
+
+                        old_task.cancel()
+
+                task = asyncio.create_task(
+                    handle_open(
+                        ws,
+                        message
+                    )
+                )
+
+                opening_connections[
+                    connection_id
+                ] = task
+
+                def cleanup_open(
+                    completed_task,
+                    cid=connection_id
+                ):
+
+                    current = (
+                        opening_connections.get(
+                            cid
+                        )
+                    )
+
+                    if current is completed_task:
+
+                        opening_connections.pop(
+                            cid,
+                            None
+                        )
+
+                task.add_done_callback(
+                    cleanup_open
+                )
+
+            # =================================================
+            # DATA
+            # =================================================
+
+            elif msg_type == "data":
+
+                await handle_data(
+                    connection_id,
+                    message.get(
+                        "data",
+                        ""
+                    )
+                )
+
+            # =================================================
+            # CLOSE
+            # =================================================
+
+            elif msg_type == "close":
+
+                await handle_close(
+                    connection_id
+                )
+
+            else:
+
+                print(
+                    "Unknown message type:",
+                    msg_type
+                )
+
+
+# ============================================================
+# Main reconnect loop
+# ============================================================
+
+async def run():
+
+    delay_index = 0
 
     while True:
 
         try:
 
-            print(
-                "Connecting to Render..."
-            )
+            await run_session()
 
-            async with websockets.connect(
-                url,
-                open_timeout=OPEN_TIMEOUT,
-                ping_interval=PING_INTERVAL,
-                ping_timeout=PING_TIMEOUT,
-                close_timeout=10,
-                max_size=None
-            ) as ws:
+            delay_index = 0
 
-                print(
-                    "Connected to Render"
-                )
+        except asyncio.CancelledError:
 
-                reconnect_delay = RECONNECT_DELAY
-
-                async for raw_message in ws:
-
-                    try:
-
-                        message = json.loads(
-                            raw_message
-                        )
-
-                    except Exception as e:
-
-                        print(
-                            "Invalid JSON:",
-                            e
-                        )
-
-                        continue
-
-                    msg_type = message.get(
-                        "type"
-                    )
-
-                    if msg_type == "pong":
-                        continue
-
-                    connection_id = message.get(
-                        "connection_id"
-                    )
-
-                    if not connection_id:
-                        continue
-
-                    # =====================================
-                    # OPEN
-                    # =====================================
-
-                    if msg_type == "open":
-
-                        asyncio.create_task(
-                            handle_open(
-                                ws,
-                                message
-                            )
-                        )
-
-                    # =====================================
-                    # DATA
-                    # =====================================
-
-                    elif msg_type == "data":
-
-                        await handle_data(
-                            ws,
-                            message
-                        )
-
-                    # =====================================
-                    # CLOSE
-                    # =====================================
-
-                    elif msg_type == "close":
-
-                        await handle_close(
-                            ws,
-                            message
-                        )
-
-                    else:
-
-                        print(
-                            "Unknown message type:",
-                            msg_type
-                        )
-
-        except (
-            websockets.exceptions.ConnectionClosed,
-            websockets.exceptions.ConnectionClosedError,
-            websockets.exceptions.ConnectionClosedOK
-        ) as e:
-
-            print(
-                "Render WebSocket closed:",
-                e
-            )
-
-        except (
-            asyncio.TimeoutError,
-            TimeoutError
-        ) as e:
-
-            print(
-                "Render connection timeout:",
-                e
-            )
+            raise
 
         except Exception as e:
 
@@ -615,27 +664,42 @@ async def run():
 
         await cleanup_connections()
 
+        delay = RECONNECT_DELAYS[
+            min(
+                delay_index,
+                len(RECONNECT_DELAYS) - 1
+            )
+        ]
+
         print(
-            f"Reconnecting in "
-            f"{reconnect_delay} seconds..."
+            f"Reconnecting in {delay} seconds..."
         )
 
         await asyncio.sleep(
-            reconnect_delay
+            delay
         )
 
-        reconnect_delay = min(
-            reconnect_delay * 2,
-            30
-        )
+        if delay_index < (
+            len(RECONNECT_DELAYS) - 1
+        ):
+
+            delay_index += 1
 
 
-# =========================================================
+# ============================================================
 # Main
-# =========================================================
+# ============================================================
 
 if __name__ == "__main__":
 
-    asyncio.run(
-        run()
-    )
+    try:
+
+        asyncio.run(
+            run()
+        )
+
+    except KeyboardInterrupt:
+
+        print(
+            "\nRunner stopped."
+        )
