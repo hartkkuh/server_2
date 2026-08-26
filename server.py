@@ -38,6 +38,7 @@ class Connection:
     def __init__(self):
 
         self.to_runner = asyncio.Queue()
+
         self.to_client = asyncio.Queue()
 
         self.closed = False
@@ -49,7 +50,10 @@ class Connection:
 # Global state
 # =========================================
 
-connections: Dict[str, Connection] = {}
+connections: Dict[
+    str,
+    Connection
+] = {}
 
 runner_ws = None
 
@@ -77,21 +81,27 @@ def check_token(token: str):
 class OpenRequest(BaseModel):
 
     token: str
+
     connection_id: str
+
     host: str
+
     port: int
 
 
 class DataRequest(BaseModel):
 
     token: str
+
     connection_id: str
+
     data: str
 
 
 class CloseRequest(BaseModel):
 
     token: str
+
     connection_id: str
 
 
@@ -104,8 +114,10 @@ async def root():
 
     return {
         "status": "online",
-        "runner_connected": runner_ws is not None,
-        "connections": len(connections),
+        "runner_connected":
+            runner_ws is not None,
+        "connections":
+            len(connections),
     }
 
 
@@ -143,9 +155,7 @@ async def websocket_endpoint(
         if runner_ws is not None:
 
             try:
-
                 await runner_ws.close()
-
             except Exception:
                 pass
 
@@ -179,7 +189,10 @@ async def websocket_endpoint(
 
             task_map = {}
 
-            for connection_id, conn in current_connections:
+            for (
+                connection_id,
+                conn
+            ) in current_connections:
 
                 if conn.closed:
                     continue
@@ -188,7 +201,9 @@ async def websocket_endpoint(
                     conn.to_runner.get()
                 )
 
-                tasks.append(task)
+                tasks.append(
+                    task
+                )
 
                 task_map[task] = (
                     connection_id,
@@ -217,11 +232,14 @@ async def websocket_endpoint(
 
                 raise
 
-            # Cancel tasks that did not win.
+            # Cancel losers
+
             for task in pending:
+
                 task.cancel()
 
-            # Send completed messages.
+            # Send winner(s)
+
             for task in done:
 
                 try:
@@ -247,7 +265,7 @@ async def websocket_endpoint(
     )
 
     # =====================================
-    # Receive messages from Runner
+    # Receive from Runner
     # =====================================
 
     try:
@@ -274,9 +292,9 @@ async def websocket_endpoint(
             if not conn:
                 continue
 
-            # -----------------------------
+            # =================================
             # Runner -> client data
-            # -----------------------------
+            # =================================
 
             if msg_type == "data":
 
@@ -292,9 +310,9 @@ async def websocket_endpoint(
                         "data": data,
                     })
 
-            # -----------------------------
-            # Runner closed connection
-            # -----------------------------
+            # =================================
+            # Runner closed
+            # =================================
 
             elif msg_type == "close":
 
@@ -304,9 +322,9 @@ async def websocket_endpoint(
                     "type": "close"
                 })
 
-            # -----------------------------
+            # =================================
             # Runner error
-            # -----------------------------
+            # =================================
 
             elif msg_type == "error":
 
@@ -338,8 +356,11 @@ async def websocket_endpoint(
         sender_task.cancel()
 
         try:
+
             await sender_task
+
         except BaseException:
+
             pass
 
         # =================================
@@ -413,9 +434,7 @@ async def open_connection(
     )
 
     return {
-
         "ok": True,
-
         "connection_id":
             connection_id,
     }
@@ -496,13 +515,11 @@ async def receive_data(
         )
 
     # =====================================
-    # If already closed
+    # Already closed
     # =====================================
 
     if conn.closed:
 
-        # Remove it only if it is still
-        # the same object.
         connections.pop(
             connection_id,
             None
@@ -515,12 +532,18 @@ async def receive_data(
     try:
 
         message = await asyncio.wait_for(
+
             conn.to_client.get(),
+
             timeout=25
+
         )
 
-        # If close arrived, clean up.
-        if message.get("type") == "close":
+        msg_type = message.get(
+            "type"
+        )
+
+        if msg_type == "close":
 
             conn.closed = True
 
@@ -529,7 +552,7 @@ async def receive_data(
                 None
             )
 
-        elif message.get("type") == "error":
+        elif msg_type == "error":
 
             conn.closed = True
 
@@ -542,8 +565,6 @@ async def receive_data(
 
     except asyncio.TimeoutError:
 
-        # Don't delete the connection.
-        # It is still alive.
         return {
             "type": "timeout"
         }
@@ -581,6 +602,7 @@ async def close_connection(
 
                     "connection_id":
                         req.connection_id,
+
                 })
 
             except Exception:
@@ -592,8 +614,8 @@ async def close_connection(
             f"{req.connection_id}"
         )
 
-    # Idempotent close:
-    # גם אם החיבור כבר נסגר, לא מחזירים 404.
+    # Idempotent
+
     return {
         "ok": True
     }
