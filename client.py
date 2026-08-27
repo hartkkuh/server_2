@@ -58,7 +58,7 @@ def get_session():
     if session is None:
 
         session = requests.Session()
-
+        session.trust_env = False
         session.verify = VERIFY_SSL
 
         session.headers.update({
