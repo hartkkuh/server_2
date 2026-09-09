@@ -28,7 +28,7 @@ TOKEN = os.environ.get(
     "CHANGE_ME"
 )
 
-RECV_TIMEOUT = 3
+RECV_TIMEOUT = 20
 
 
 # =========================================================
@@ -63,6 +63,8 @@ runner_ws: Optional[
 
 runner_lock = asyncio.Lock()
 
+runner_wakeup = asyncio.Event()
+
 
 # =========================================================
 # Authentication
@@ -83,7 +85,6 @@ def check_token(
 # =========================================================
 # Models
 # =========================================================
-
 class OpenRequest(BaseModel):
 
     token: str
@@ -114,10 +115,8 @@ async def root():
 
     return {
         "status": "online",
-        "runner_connected":
-            runner_ws is not None,
-        "connections":
-            len(connections),
+        "runner_connected": runner_ws is not None,
+        "connections": len(connections),
     }
 
 
@@ -126,15 +125,11 @@ async def root():
 # =========================================================
 
 @app.websocket("/ws")
-async def websocket_endpoint(
-    websocket: WebSocket
-):
+async def websocket_endpoint(websocket: WebSocket):
 
     global runner_ws
 
-    token = websocket.query_params.get(
-        "token"
-    )
+    token = websocket.query_params.get("token")
 
     if token != TOKEN:
 
@@ -182,58 +177,33 @@ async def websocket_endpoint(
             if runner_ws is not websocket:
                 return
 
-            # Wait for something from any connection.
-            #
-            # Instead of creating and cancelling many
-            # Queue.get() tasks repeatedly, use a small
-            # polling cycle.
+            await runner_wakeup.wait()
+            runner_wakeup.clear()
 
-            sent = False
+            while True:
 
-            for (
-                connection_id,
-                conn
-            ) in list(
-                connections.items()
-            ):
+                sent = False
 
-                if conn.closed:
-                    continue
+                for connection_id, conn in list(connections.items()):
 
-                try:
+                    if conn.closed:
+                        continue
 
-                    message = (
-                        conn.to_runner.get_nowait()
-                    )
+                    for _ in range(64):
 
-                except asyncio.QueueEmpty:
+                        try:
+                            message = conn.to_runner.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
 
-                    continue
+                        try:
+                            await websocket.send_json(message)
+                            sent = True
+                        except Exception:
+                            return
 
-                try:
-
-                    await websocket.send_json(
-                        message
-                    )
-
-                    sent = True
-
-                except Exception:
-
-                    return
-
-                # Send only one message per cycle.
-                #
-                # This prevents one connection from
-                # monopolizing the WebSocket.
-
-                break
-
-            if not sent:
-
-                await asyncio.sleep(
-                    0.01
-                )
+                if not sent:
+                    break
 
     sender_task = asyncio.create_task(
         sender()
@@ -395,6 +365,7 @@ async def open_connection(
         "port":
             req.port,
     })
+    runner_wakeup.set()
 
     print(
         f"[OPEN] "
@@ -447,6 +418,7 @@ async def send_data(
         "data":
             req.data,
     })
+    runner_wakeup.set()
 
     return {
         "ok": True
@@ -557,6 +529,7 @@ async def close_connection(
                     "connection_id":
                         req.connection_id,
                 })
+                runner_wakeup.set()
 
             except Exception:
                 pass

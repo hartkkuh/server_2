@@ -17,7 +17,7 @@ TOKEN = "131232"
 LOCAL_HOST = "127.0.0.1"
 LOCAL_PORT = 3128
 
-BUFFER_SIZE = 16384
+BUFFER_SIZE = 65536
 
 VERIFY_SSL = False
 
@@ -28,7 +28,7 @@ REQUEST_RETRIES = 5
 
 # קצר בכוונה.
 # אנחנו לא רוצים שכל /recv יחכה 10 שניות.
-RECV_TIMEOUT_SECONDS = 3
+RECV_TIMEOUT_SECONDS = 25
 
 # זמן בין retries
 RETRY_BASE_DELAY = 0.4

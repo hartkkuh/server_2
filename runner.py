@@ -17,7 +17,7 @@ TOKEN = os.environ[
     "PROXY_TOKEN"
 ]
 
-BUFFER_SIZE = 16384
+BUFFER_SIZE = 65536
 
 
 # =========================================================
