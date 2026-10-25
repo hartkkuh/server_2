@@ -3,6 +3,7 @@ import threading
 import uuid
 import base64
 import requests
+from requests.adapters import HTTPAdapter
 import urllib3
 import time
 
@@ -25,7 +26,20 @@ VERIFY_SSL = False
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 15
 
-REQUEST_RETRIES = 5
+REQUEST_RETRIES = 2
+
+# Render החינמי לא שורד מאות מנהרות במקביל.
+# הדפדפן עצמו פותח בערך 6 חיבורים לאותו אתר.
+MAX_TUNNELS = 20
+MAX_PER_HOST = 6
+
+# רעש רקע של Windows שפותח עשרות חיבורים וחוזר מיד.
+QUIET_HOST_MARKERS = (
+    "displaycatalog",
+    "events.data.microsoft.com",
+    "beacons.gcp.gvt2.com",
+)
+QUIET_HOST_LIMIT = 2
 
 # קצר בכוונה.
 # אנחנו לא רוצים שכל /recv יחכה 10 שניות.
@@ -42,34 +56,215 @@ if not VERIFY_SSL:
 
 
 # =========================================================
-# Thread-local HTTP Session
+# Shared HTTP Session
 # =========================================================
 
-thread_local = threading.local()
+# סשן אחד לכל החוטים. סשן נפרד לכל מנהרה פותח
+# מאות חיבורי TLS אל Render ומפיל את המופע.
+
+def build_session():
+
+    session = requests.Session()
+    session.trust_env = False
+    session.verify = VERIFY_SSL
+
+    session.headers.update({
+        "User-Agent":
+            "HTTPS-Tunnel-Client/3.0"
+    })
+
+    pool = MAX_TUNNELS * 2 + 8
+
+    adapter = HTTPAdapter(
+        pool_connections=pool,
+        pool_maxsize=pool,
+        pool_block=True,
+    )
+
+    session.mount(
+        "https://",
+        adapter
+    )
+
+    session.mount(
+        "http://",
+        adapter
+    )
+
+    return session
+
+
+http = build_session()
 
 
 def get_session():
 
-    session = getattr(
-        thread_local,
-        "session",
-        None
+    return http
+
+
+# =========================================================
+# Admission control
+# =========================================================
+
+tunnel_slots = threading.BoundedSemaphore(
+    MAX_TUNNELS
+)
+
+host_counts = {}
+
+host_lock = threading.Lock()
+
+reject_lock = threading.Lock()
+
+rejected = 0
+
+last_reject_log = 0.0
+
+
+def host_limit(
+    host
+):
+
+    for marker in QUIET_HOST_MARKERS:
+
+        if marker in host:
+
+            return QUIET_HOST_LIMIT
+
+    return MAX_PER_HOST
+
+
+def note_reject(
+    host
+):
+
+    global rejected
+    global last_reject_log
+
+    with reject_lock:
+
+        rejected += 1
+
+        now = time.monotonic()
+
+        if now - last_reject_log < 2:
+
+            return
+
+        count = rejected
+
+        rejected = 0
+
+        last_reject_log = now
+
+    print(
+        f"Busy, skipped {count} "
+        f"connections (last: {host})"
     )
 
-    if session is None:
 
-        session = requests.Session()
-        session.trust_env = False
-        session.verify = VERIFY_SSL
+def acquire_slot(
+    host
+):
 
-        session.headers.update({
-            "User-Agent":
-                "HTTPS-Tunnel-Client/3.0"
-        })
+    key = host.lower()
 
-        thread_local.session = session
+    limit = host_limit(
+        key
+    )
 
-    return session
+    if not tunnel_slots.acquire(
+        blocking=False
+    ):
+
+        note_reject(
+            key
+        )
+
+        return False
+
+    with host_lock:
+
+        current = host_counts.get(
+            key,
+            0
+        )
+
+        if current >= limit:
+
+            over = True
+
+        else:
+
+            host_counts[key] = (
+                current + 1
+            )
+
+            over = False
+
+    if over:
+
+        tunnel_slots.release()
+
+        note_reject(
+            key
+        )
+
+        return False
+
+    return True
+
+
+def release_slot(
+    host
+):
+
+    key = host.lower()
+
+    with host_lock:
+
+        current = host_counts.get(
+            key,
+            0
+        ) - 1
+
+        if current <= 0:
+
+            host_counts.pop(
+                key,
+                None
+            )
+
+        else:
+
+            host_counts[key] = current
+
+    tunnel_slots.release()
+
+
+def reject_busy(
+    client_socket
+):
+
+    try:
+
+        client_socket.sendall(
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Connection: close\r\n"
+            b"Content-Length: 0\r\n"
+            b"Retry-After: 1\r\n"
+            b"\r\n"
+        )
+
+    except Exception:
+        pass
+
+    try:
+
+        client_socket.close()
+
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -80,6 +275,7 @@ def render_request(
     method,
     path,
     timeout=None,
+    retries=None,
     **kwargs
 ):
 
@@ -95,8 +291,12 @@ def render_request(
 
     session = get_session()
 
+    if retries is None:
+
+        retries = REQUEST_RETRIES
+
     for attempt in range(
-        REQUEST_RETRIES
+        retries
     ):
 
         try:
@@ -126,7 +326,7 @@ def render_request(
 
             last_error = e
 
-            if attempt + 1 >= REQUEST_RETRIES:
+            if attempt + 1 >= retries:
                 raise last_error
 
             delay = min(
@@ -147,14 +347,16 @@ def render_request(
 def render_post(
     path,
     json_data,
-    timeout=None
+    timeout=None,
+    retries=None
 ):
 
     response = render_request(
         "POST",
         path,
         json=json_data,
-        timeout=timeout
+        timeout=timeout,
+        retries=retries
     )
 
     return response.json()
@@ -167,14 +369,16 @@ def render_post(
 def render_get(
     path,
     params=None,
-    timeout=None
+    timeout=None,
+    retries=None
 ):
 
     response = render_request(
         "GET",
         path,
         params=params,
-        timeout=timeout
+        timeout=timeout,
+        retries=retries
     )
 
     return response.json()
@@ -198,6 +402,9 @@ def send_data(
 
     try:
 
+        # בלי retry: בקשה שכבר נכנסה לתור
+        # תשלח את אותם בייטים פעם שנייה
+        # ותשבור את ה-TLS.
         render_post(
             "/data",
             {
@@ -209,7 +416,8 @@ def send_data(
             timeout=(
                 CONNECT_TIMEOUT,
                 READ_TIMEOUT
-            )
+            ),
+            retries=1
         )
 
         return True
@@ -299,7 +507,8 @@ def receive_loop(
                     timeout=(
                         CONNECT_TIMEOUT,
                         RECV_TIMEOUT_SECONDS
-                    )
+                    ),
+                    retries=2
                 )
 
                 errors = 0
@@ -432,20 +641,33 @@ def receive_loop(
                     ""
                 )
 
-                if not encoded:
-                    continue
-
                 try:
 
-                    data = base64.b64decode(
-                        encoded
-                    )
+                    if encoded:
 
-                    if data:
-
-                        client_socket.sendall(
-                            data
+                        data = base64.b64decode(
+                            encoded
                         )
+
+                        if data:
+
+                            client_socket.sendall(
+                                data
+                            )
+
+                    if result.get(
+                        "closed"
+                    ):
+
+                        print(
+                            f"[{connection_id}] "
+                            f"Remote closed connection"
+                        )
+
+                        break
+
+                    if not encoded:
+                        continue
 
                 except (
                     BrokenPipeError,
@@ -674,6 +896,12 @@ def handle_client(
 
     stop_event = threading.Event()
 
+    held = False
+
+    opened = False
+
+    host = None
+
     try:
 
         (
@@ -691,6 +919,18 @@ def handle_client(
             client_socket.close()
             return
 
+        if not acquire_slot(
+            host
+        ):
+
+            reject_busy(
+                client_socket
+            )
+
+            return
+
+        held = True
+
         print(
             f"[{connection_id}] "
             f"{method} "
@@ -700,6 +940,8 @@ def handle_client(
         # =================================================
         # Open remote connection
         # =================================================
+
+        opened = True
 
         render_post(
             "/open",
@@ -713,7 +955,8 @@ def handle_client(
             timeout=(
                 CONNECT_TIMEOUT,
                 READ_TIMEOUT
-            )
+            ),
+            retries=2
         )
 
         # =================================================
@@ -815,15 +1058,12 @@ def handle_client(
                 data
             ):
 
-                # אם Render לא זמין לרגע,
-                # נותנים ל-receive loop להמשיך,
-                # אבל לא נשלח אינסוף מידע שנאגר.
-                if stop_event.is_set():
-                    break
-
-                time.sleep(0.2)
-
-                continue
+                # הבייטים האלה כבר יצאו מהסוקט.
+                # המשך ישלח המשך TLS בלי החתיכה
+                # הזאת, אז סוגרים ונותנים לדפדפן
+                # לפתוח חיבור חדש.
+                stop_event.set()
+                break
 
     except Exception as e:
 
@@ -838,9 +1078,17 @@ def handle_client(
 
         stop_event.set()
 
-        close_remote(
-            connection_id
-        )
+        if opened:
+
+            close_remote(
+                connection_id
+            )
+
+        if held:
+
+            release_slot(
+                host
+            )
 
         try:
             client_socket.shutdown(
@@ -909,6 +1157,11 @@ def start_proxy():
     print(
         f"SSL verification: "
         f"{VERIFY_SSL}"
+    )
+    print(
+        f"Max tunnels: "
+        f"{MAX_TUNNELS} "
+        f"({MAX_PER_HOST} per host)"
     )
     print()
 

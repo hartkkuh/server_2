@@ -313,6 +313,12 @@ async def handle_data(
         )
 
     if connection is None:
+
+        await send_close(
+            ws,
+            connection_id
+        )
+
         return
 
     reader, writer = connection
@@ -375,6 +381,11 @@ async def handle_data(
 
         except Exception:
             pass
+
+        await send_close(
+            ws,
+            connection_id
+        )
 
 
 # =========================================================
