@@ -28,16 +28,26 @@ READ_TIMEOUT = 15
 
 REQUEST_RETRIES = 2
 
-# Render החינמי לא שורד מאות מנהרות במקביל.
-# הדפדפן עצמו פותח בערך 6 חיבורים לאותו אתר.
-MAX_TUNNELS = 20
-MAX_PER_HOST = 6
+# תקרה גבוהה מספיק לדפדפן, ל-Windows ול-Cursor יחד.
+# רעש רקע לא נכנס לחלק השמור, כדי שאתר שהמשתמש פתח
+# לא יקבל 503 רק כי החיבורים ברקע תפסו הכל.
+MAX_TUNNELS = 64
+MAX_PER_HOST = 8
+RESERVED_INTERACTIVE = 16
+SLOT_WAIT_SECONDS = 10
 
-# רעש רקע של Windows שפותח עשרות חיבורים וחוזר מיד.
 QUIET_HOST_MARKERS = (
     "displaycatalog",
     "events.data.microsoft.com",
-    "beacons.gcp.gvt2.com",
+    "beacons",
+    "msftconnecttest.com",
+    "optimizationguide-pa.googleapis.com",
+    "clients4.google.com",
+    "chromesync",
+    "accountcapabilities-pa.googleapis.com",
+    "signaler-pa.clients6.google.com",
+    "update.googleapis.com",
+    "safebrowsing",
 )
 QUIET_HOST_LIMIT = 2
 
@@ -73,7 +83,7 @@ def build_session():
             "HTTPS-Tunnel-Client/3.0"
     })
 
-    pool = MAX_TUNNELS * 2 + 8
+    pool = MAX_TUNNELS * 3 + 8
 
     adapter = HTTPAdapter(
         pool_connections=pool,
@@ -106,13 +116,11 @@ def get_session():
 # Admission control
 # =========================================================
 
-tunnel_slots = threading.BoundedSemaphore(
-    MAX_TUNNELS
-)
+slot_cv = threading.Condition()
+
+tunnel_total = 0
 
 host_counts = {}
-
-host_lock = threading.Lock()
 
 reject_lock = threading.Lock()
 
@@ -121,7 +129,7 @@ rejected = 0
 last_reject_log = 0.0
 
 
-def host_limit(
+def is_quiet_host(
     host
 ):
 
@@ -129,9 +137,9 @@ def host_limit(
 
         if marker in host:
 
-            return QUIET_HOST_LIMIT
+            return True
 
-    return MAX_PER_HOST
+    return False
 
 
 def note_reject(
@@ -167,61 +175,92 @@ def acquire_slot(
     host
 ):
 
+    global tunnel_total
+
     key = host.lower()
 
-    limit = host_limit(
+    quiet = is_quiet_host(
         key
     )
 
-    if not tunnel_slots.acquire(
-        blocking=False
-    ):
+    if quiet:
 
-        note_reject(
-            key
+        limit = QUIET_HOST_LIMIT
+
+        allowed_total = (
+            MAX_TUNNELS
+            - RESERVED_INTERACTIVE
         )
 
-        return False
+        deadline = time.monotonic()
 
-    with host_lock:
+    else:
 
-        current = host_counts.get(
-            key,
-            0
+        limit = MAX_PER_HOST
+
+        allowed_total = MAX_TUNNELS
+
+        deadline = (
+            time.monotonic()
+            + SLOT_WAIT_SECONDS
         )
 
-        if current >= limit:
+    with slot_cv:
 
-            over = True
+        while True:
 
-        else:
-
-            host_counts[key] = (
-                current + 1
+            current = host_counts.get(
+                key,
+                0
             )
 
-            over = False
+            if (
+                tunnel_total < allowed_total
+                and current < limit
+            ):
 
-    if over:
+                host_counts[key] = (
+                    current + 1
+                )
 
-        tunnel_slots.release()
+                tunnel_total += 1
 
-        note_reject(
-            key
-        )
+                return True
 
-        return False
+            remaining = (
+                deadline
+                - time.monotonic()
+            )
 
-    return True
+            if remaining <= 0:
+
+                break
+
+            slot_cv.wait(
+                remaining
+            )
+
+    note_reject(
+        key
+    )
+
+    return False
 
 
 def release_slot(
     host
 ):
 
+    global tunnel_total
+
     key = host.lower()
 
-    with host_lock:
+    with slot_cv:
+
+        tunnel_total = max(
+            0,
+            tunnel_total - 1
+        )
 
         current = host_counts.get(
             key,
@@ -239,7 +278,7 @@ def release_slot(
 
             host_counts[key] = current
 
-    tunnel_slots.release()
+        slot_cv.notify_all()
 
 
 def reject_busy(
@@ -579,7 +618,7 @@ def receive_loop(
 
                 # חשוב:
                 # לא סוגרים TCP מקומי מיד.
-                if errors >= 30:
+                if errors >= 5:
 
                     print(
                         f"[{connection_id}] "
@@ -606,7 +645,7 @@ def receive_loop(
                     f"receive error: {e}"
                 )
 
-                if errors >= 15:
+                if errors >= 5:
                     break
 
                 time.sleep(0.5)
@@ -1161,7 +1200,8 @@ def start_proxy():
     print(
         f"Max tunnels: "
         f"{MAX_TUNNELS} "
-        f"({MAX_PER_HOST} per host)"
+        f"({MAX_PER_HOST} per host, "
+        f"{RESERVED_INTERACTIVE} reserved)"
     )
     print()
 
