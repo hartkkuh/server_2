@@ -33,9 +33,13 @@ RECV_TIMEOUT = 20
 
 MAX_CONNECTIONS = 96
 
-QUEUE_SIZE = 32
+# התור לכיוון הדפדפן חייב להחזיק דף שלם.
+# תור קטן זורק את אמצע ה-JavaScript והדף נשאר לבן.
+RUNNER_QUEUE_SIZE = 64
 
-MAX_BATCH_BYTES = 256 * 1024
+CLIENT_QUEUE_SIZE = 160
+
+MAX_BATCH_BYTES = 1024 * 1024
 
 
 # =========================================================
@@ -47,11 +51,11 @@ class Connection:
     def __init__(self):
 
         self.to_runner = asyncio.Queue(
-            maxsize=QUEUE_SIZE
+            maxsize=RUNNER_QUEUE_SIZE
         )
 
         self.to_client = asyncio.Queue(
-            maxsize=QUEUE_SIZE
+            maxsize=CLIENT_QUEUE_SIZE
         )
 
         self.closed = False
@@ -93,7 +97,28 @@ def check_token(
         )
 
 
-def enqueue_client(
+async def enqueue_client(
+    conn: Connection,
+    message: dict
+):
+
+    # לא זורקים בייטים. אם הדפדפן איטי, מחכים
+    # שהתור יתפנה במקום לחתוך את התשובה.
+    try:
+
+        await asyncio.wait_for(
+            conn.to_client.put(
+                message
+            ),
+            timeout=20
+        )
+
+    except asyncio.TimeoutError:
+
+        conn.closed = True
+
+
+def wake_client(
     conn: Connection,
     message: dict
 ):
@@ -106,7 +131,7 @@ def enqueue_client(
 
     except asyncio.QueueFull:
 
-        conn.closed = True
+        pass
 
 
 def drop_finished_connections():
@@ -139,7 +164,7 @@ async def fail_all_connections(
 
         conn.closed = True
 
-        enqueue_client(
+        wake_client(
             conn,
             {
                 "type": "error",
@@ -514,7 +539,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 if data:
 
-                    enqueue_client(
+                    await enqueue_client(
                         conn,
                         {
                             "type": "data",
@@ -545,7 +570,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 conn.closed = True
 
-                enqueue_client(
+                await enqueue_client(
                     conn,
                     {
                         "type": "close"
@@ -560,7 +585,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 conn.closed = True
 
-                enqueue_client(
+                await enqueue_client(
                     conn,
                     {
                         "type": "error",
@@ -862,7 +887,7 @@ async def close_connection(
 
         # מעיר את /recv שמחכה על תור ריק,
         # אחרת הבקשה נשארת תפוסה עד ה-timeout.
-        enqueue_client(
+        wake_client(
             conn,
             {
                 "type": "close"

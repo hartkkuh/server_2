@@ -1,4 +1,5 @@
 import os
+import socket
 import asyncio
 import base64
 import json
@@ -160,6 +161,38 @@ async def pipe_reader(
 # OPEN
 # =========================================================
 
+async def open_tcp(
+    host,
+    port
+):
+
+    last_error = None
+
+    # IPv6 בלי נתיב נכשל עם errno 101 ומשאיר דף ריק.
+    # קודם IPv4, ורק אם אין כתובת כזו נופלים לבררת המחדל.
+    for family in (
+        socket.AF_INET,
+        socket.AF_UNSPEC,
+    ):
+
+        try:
+
+            return await asyncio.wait_for(
+                asyncio.open_connection(
+                    host,
+                    port,
+                    family=family
+                ),
+                timeout=12
+            )
+
+        except OSError as e:
+
+            last_error = e
+
+    raise last_error
+
+
 async def handle_open(
     ws,
     message
@@ -192,12 +225,9 @@ async def handle_open(
         # =================================================
 
         reader, writer = (
-            await asyncio.wait_for(
-                asyncio.open_connection(
-                    host,
-                    port
-                ),
-                timeout=15
+            await open_tcp(
+                host,
+                port
             )
         )
 

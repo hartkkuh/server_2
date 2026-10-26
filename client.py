@@ -439,36 +439,63 @@ def send_data(
         data
     ).decode("ascii")
 
-    try:
+    # 429 אומר שהבייטים לא נכנסו לתור, אז מותר
+    # לנסות שוב. 404 ו-410 כבר לא יתקבלו.
+    for attempt in range(4):
 
-        # בלי retry: בקשה שכבר נכנסה לתור
-        # תשלח את אותם בייטים פעם שנייה
-        # ותשבור את ה-TLS.
-        render_post(
-            "/data",
-            {
-                "token": TOKEN,
-                "connection_id":
-                    connection_id,
-                "data": encoded,
-            },
-            timeout=(
-                CONNECT_TIMEOUT,
-                READ_TIMEOUT
-            ),
-            retries=1
-        )
+        try:
 
-        return True
+            render_post(
+                "/data",
+                {
+                    "token": TOKEN,
+                    "connection_id":
+                        connection_id,
+                    "data": encoded,
+                },
+                timeout=(
+                    CONNECT_TIMEOUT,
+                    READ_TIMEOUT
+                ),
+                retries=1
+            )
 
-    except Exception as e:
+            return True
 
-        print(
-            f"[{connection_id}] "
-            f"send_data error: {e}"
-        )
+        except requests.HTTPError as e:
 
-        return False
+            status = (
+                e.response.status_code
+                if e.response is not None
+                else None
+            )
+
+            if (
+                status == 429
+                and attempt < 3
+            ):
+
+                time.sleep(0.3)
+
+                continue
+
+            print(
+                f"[{connection_id}] "
+                f"send_data error: {e}"
+            )
+
+            return False
+
+        except Exception as e:
+
+            print(
+                f"[{connection_id}] "
+                f"send_data error: {e}"
+            )
+
+            return False
+
+    return False
 
 
 def open_tunnel(
@@ -590,10 +617,35 @@ def close_remote(
 # Receive loop
 # =========================================================
 
+def close_client_socket(
+    client_socket,
+    write_lock
+):
+
+    with write_lock:
+
+        try:
+
+            client_socket.shutdown(
+                socket.SHUT_RDWR
+            )
+
+        except Exception:
+            pass
+
+        try:
+
+            client_socket.close()
+
+        except Exception:
+            pass
+
+
 def receive_loop(
     client_socket,
     connection_id,
-    stop_event
+    stop_event,
+    write_lock
 ):
 
     errors = 0
@@ -756,9 +808,11 @@ def receive_loop(
 
                         if data:
 
-                            client_socket.sendall(
-                                data
-                            )
+                            with write_lock:
+
+                                client_socket.sendall(
+                                    data
+                                )
 
                     if result.get(
                         "closed"
@@ -824,17 +878,10 @@ def receive_loop(
 
         stop_event.set()
 
-        try:
-            client_socket.shutdown(
-                socket.SHUT_RDWR
-            )
-        except Exception:
-            pass
-
-        try:
-            client_socket.close()
-        except Exception:
-            pass
+        close_client_socket(
+            client_socket,
+            write_lock
+        )
 
 
 def rewrite_request_line(
@@ -1084,6 +1131,8 @@ def handle_client(
 
     flush_receive = False
 
+    write_lock = threading.Lock()
+
     try:
 
         (
@@ -1153,7 +1202,8 @@ def handle_client(
             args=(
                 client_socket,
                 connection_id,
-                stop_event
+                stop_event,
+                write_lock
             ),
             daemon=True
         )
@@ -1268,17 +1318,10 @@ def handle_client(
                 host
             )
 
-        try:
-            client_socket.shutdown(
-                socket.SHUT_RDWR
-            )
-        except Exception:
-            pass
-
-        try:
-            client_socket.close()
-        except Exception:
-            pass
+        close_client_socket(
+            client_socket,
+            write_lock
+        )
 
 
 # =========================================================
