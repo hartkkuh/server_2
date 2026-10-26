@@ -511,8 +511,8 @@ async def run():
 
             async with websockets.connect(
                 url,
-                ping_interval=15,
-                ping_timeout=15,
+                ping_interval=30,
+                ping_timeout=60,
                 close_timeout=5,
                 max_size=None,
                 open_timeout=20

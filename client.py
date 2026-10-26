@@ -471,6 +471,72 @@ def send_data(
         return False
 
 
+def open_tunnel(
+    connection_id,
+    host,
+    port
+):
+
+    # 503 קורה כשה-runner רגע מנותק, ו-429 כשהתור מלא.
+    # הדפדפן עדיין מחכה ל-CONNECT, אז יש זמן לנסות שוב.
+    deadline = time.monotonic() + 8
+
+    last_error = None
+
+    while True:
+
+        try:
+
+            render_post(
+                "/open",
+                {
+                    "token": TOKEN,
+                    "connection_id":
+                        connection_id,
+                    "host": host,
+                    "port": port,
+                },
+                timeout=(
+                    CONNECT_TIMEOUT,
+                    READ_TIMEOUT
+                ),
+                retries=1
+            )
+
+            return
+
+        except requests.HTTPError as e:
+
+            last_error = e
+
+            status = (
+                e.response.status_code
+                if e.response is not None
+                else None
+            )
+
+            if status not in (
+                429,
+                503
+            ):
+
+                raise
+
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ) as e:
+
+            last_error = e
+
+        if time.monotonic() >= deadline:
+
+            raise last_error
+
+        time.sleep(0.4)
+
+
 # =========================================================
 # Close remote
 # =========================================================
@@ -714,10 +780,16 @@ def receive_loop(
                     OSError,
                 ) as e:
 
-                    print(
-                        f"[{connection_id}] "
-                        f"Local socket closed: {e}"
-                    )
+                    if getattr(
+                        e,
+                        "winerror",
+                        None
+                    ) != 10038:
+
+                        print(
+                            f"[{connection_id}] "
+                            f"Local socket closed: {e}"
+                        )
 
                     break
 
@@ -763,6 +835,56 @@ def receive_loop(
             client_socket.close()
         except Exception:
             pass
+
+
+def rewrite_request_line(
+    lines
+):
+
+    if not lines or not lines[0]:
+
+        return lines
+
+    bits = lines[0].split(
+        " ",
+        2
+    )
+
+    if len(bits) < 3:
+
+        return lines
+
+    method, target, version = bits
+
+    lowered = target.lower()
+
+    if (
+        lowered.startswith("http://")
+        or lowered.startswith("https://")
+    ):
+
+        scheme = lowered.find("://")
+
+        path_at = target.find(
+            "/",
+            scheme + 3
+        )
+
+        if path_at == -1:
+
+            target = "/"
+
+        else:
+
+            target = target[path_at:]
+
+        lines = list(lines)
+
+        lines[0] = (
+            f"{method} {target} {version}"
+        )
+
+    return lines
 
 
 # =========================================================
@@ -912,11 +1034,28 @@ def parse_target(
             port_string
         )
 
+    # שומרים את הבקשה המקורית, כולל הנתיב והכותרות.
+    # בקשה מקוצרת ל-GET / גורמת לשרת להחזיר תשובה
+    # שהדפדפן לא יכול לקרוא.
+    lines = rewrite_request_line(
+        lines
+    )
+
+    forwarded = "\r\n".join(
+        line
+        for line in lines
+        if not line.lower().startswith(
+            "proxy-connection:"
+        )
+    ).encode(
+        "iso-8859-1"
+    ) + remaining
+
     return (
         host,
         port,
         False,
-        remaining,
+        forwarded,
         method
     )
 
@@ -940,6 +1079,10 @@ def handle_client(
     opened = False
 
     host = None
+
+    receiver = None
+
+    flush_receive = False
 
     try:
 
@@ -980,23 +1123,13 @@ def handle_client(
         # Open remote connection
         # =================================================
 
-        opened = True
-
-        render_post(
-            "/open",
-            {
-                "token": TOKEN,
-                "connection_id":
-                    connection_id,
-                "host": host,
-                "port": port,
-            },
-            timeout=(
-                CONNECT_TIMEOUT,
-                READ_TIMEOUT
-            ),
-            retries=2
+        open_tunnel(
+            connection_id,
+            host,
+            port
         )
+
+        opened = True
 
         # =================================================
         # HTTPS
@@ -1012,31 +1145,7 @@ def handle_client(
             )
 
         # =================================================
-        # HTTP
-        # =================================================
-
-        else:
-
-            request = (
-                f"{method} "
-                f"http://{host}/ "
-                f"HTTP/1.1\r\n"
-                f"Host: {host}\r\n"
-                f"Connection: close\r\n"
-                f"\r\n"
-            ).encode(
-                "iso-8859-1"
-            )
-
-            if not send_data(
-                connection_id,
-                request
-            ):
-
-                return
-
-        # =================================================
-        # Start receiver BEFORE sending buffered data
+        # Start receiver BEFORE sending the request
         # =================================================
 
         receiver = threading.Thread(
@@ -1052,6 +1161,22 @@ def handle_client(
         receiver.start()
 
         # =================================================
+        # HTTP
+        # =================================================
+
+        if not is_connect:
+
+            if not send_data(
+                connection_id,
+                remaining
+            ):
+
+                flush_receive = True
+                return
+
+            remaining = b""
+
+        # =================================================
         # Send bytes already received with headers
         # =================================================
 
@@ -1062,7 +1187,7 @@ def handle_client(
                 remaining
             ):
 
-                stop_event.set()
+                flush_receive = True
                 return
 
         # =================================================
@@ -1097,11 +1222,10 @@ def handle_client(
                 data
             ):
 
-                # הבייטים האלה כבר יצאו מהסוקט.
-                # המשך ישלח המשך TLS בלי החתיכה
-                # הזאת, אז סוגרים ונותנים לדפדפן
-                # לפתוח חיבור חדש.
-                stop_event.set()
+                # התשובה אולי כבר ממתינה בצד השני.
+                # סוגרים את הסוקט רק אחרי שהיא נכתבת,
+                # אחרת הדפדפן רואה תשובה חתוכה.
+                flush_receive = True
                 break
 
     except Exception as e:
@@ -1115,6 +1239,14 @@ def handle_client(
 
     finally:
 
+        if (
+            flush_receive
+            and receiver is not None
+            and receiver.is_alive()
+        ):
+
+            receiver.join(3)
+
         stop_event.set()
 
         if opened:
@@ -1122,6 +1254,13 @@ def handle_client(
             close_remote(
                 connection_id
             )
+
+        if (
+            receiver is not None
+            and receiver.is_alive()
+        ):
+
+            receiver.join(2)
 
         if held:
 

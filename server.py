@@ -31,7 +31,7 @@ TOKEN = os.environ.get(
 
 RECV_TIMEOUT = 20
 
-MAX_CONNECTIONS = 32
+MAX_CONNECTIONS = 96
 
 QUEUE_SIZE = 32
 
@@ -107,6 +107,24 @@ def enqueue_client(
     except asyncio.QueueFull:
 
         conn.closed = True
+
+
+def drop_finished_connections():
+
+    for connection_id, conn in list(
+        connections.items()
+    ):
+
+        if (
+            conn.closed
+            and conn.to_client.empty()
+            and conn.to_runner.empty()
+        ):
+
+            connections.pop(
+                connection_id,
+                None
+            )
 
 
 async def fail_all_connections(
@@ -613,6 +631,8 @@ async def open_connection(
             status_code=503,
             detail="Runner is not connected"
         )
+
+    drop_finished_connections()
 
     if len(connections) >= MAX_CONNECTIONS:
 
